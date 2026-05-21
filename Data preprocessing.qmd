@@ -1,0 +1,864 @@
+### In this section, we will perform data cleaning and preprocessing on the dataset. This includes handling missing values, encoding the correct structure, and separating the large database into smaller datasets that correspond to: assembly-level (1) Species Richness, (2) Abundance and Species-level (3) captures and (4) acoustics .
+
+### Loading packages, setting the working directory, and loading the dataset:
+```{r}
+#Load necessary libraries
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+library(purrr)
+
+#setting working directory: 
+setwd("/Users/dillanhoyt/Documents/PhD/Meta Analysis/Statistics/Meta Analysis")
+
+# Load the dataset
+meta_bats <- read.csv("MetaAnalysis_updated_withZeros.csv")
+```
+
+### Calculating the capture rate for each observation:
+```{r}
+#Setting structure of variables 
+meta_bats$Response <- as.numeric(meta_bats$Response)
+meta_bats$Mist_net_hours <- as.numeric(meta_bats$Mist_net_hours)
+
+#Calculating the capture rate for each observation
+meta_bats$Rate <- meta_bats$Response/meta_bats$Mist_net_hours
+```
+
+### Assigning Rate as value for lnRR calculation for capture-based and acoustic database, and leaving raw value for species richness 
+
+```{r}
+meta_bats <- meta_bats %>%
+  mutate(
+    lnRR_input = case_when(
+      DataType %in% c("AB", "ACT") ~ Rate,     # Standardize by effort
+      DataType == "SR" ~ Response,             # Use raw species count
+      TRUE ~ NA_real_
+    )
+  )
+
+  #Assiging a 10,000 ha value to CF and leaving an NA value for fragments without sizes, otherwise leave the value as is for fragments with sizes.
+  meta_bats <- meta_bats %>%
+  mutate(
+    Fragment_size_corrected = case_when(
+      # Continuous forest gets an artificially large "fragment" size
+      Treatment == "Cont" ~ 10000,
+      
+      # Fragment but size missing → keep as NA so downstream code can track it
+      Treatment == "Frag" & is.na(Fragment_size_ha) ~ NA_real_,
+      
+      # Otherwise use reported fragment size
+      TRUE ~ Fragment_size_ha
+    )
+  )
+
+  #  Create a clean fragment key (handle NA fragments) - if it doesn't have a fragment size (appears with NA). then assign it "CF" value.
+meta_tmp <- meta_bats %>%
+  dplyr::mutate(
+    Fragment_key = dplyr::case_when(
+      Treatment == "Cont" ~ "CF",
+      Treatment == "Frag" & is.na(Fragment_size_corrected) ~ "Unknown",
+      Treatment == "Frag" ~ as.character(Fragment_size_corrected),
+      TRUE ~ "Other"
+    )
+  )
+
+# Sample sizes per Paper × Species × Treatment 
+sample_lookup <- meta_bats %>%
+  dplyr::group_by(Paper_ID, Species, Treatment) %>%
+  dplyr::summarise(total_sample_size = sum(Sample_size, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(
+    names_from  = Treatment,
+    values_from = total_sample_size,
+    names_prefix = "n_",
+    values_fill = 0
+  )
+
+# Join and rename (drop pre-existing nt/nc if present)
+meta_species_FC_with_nt_nc <- meta_tmp %>%
+  dplyr::select(-dplyr::any_of(c("nt","nc","n_Frag","n_Cont"))) %>%
+  dplyr::left_join(sample_lookup, by = c("Paper_ID", "Species")) %>%
+  dplyr::rename(nt = n_Frag, nc = n_Cont)
+
+#re-naming this df for later use:
+meta_bats <- meta_species_FC_with_nt_nc
+```
+
+### Creating a unique fragment ID column for each of my fragments so that the same fragment sampled multiple times isn't being compared to itself, and only to other fragments. 
+
+```{r}
+#Creating a unique fragment ID column for each of my fragments
+meta_bats <- meta_bats %>%
+  dplyr::mutate(
+    UniqueFragID = paste(
+      Paper_ID,
+      Latitude,
+      Longitude,
+      Fragment_size_ha,
+      Unique_name,
+      sep = "_"
+    )
+  )
+#Saving this information as a separate dataset for later use in the meta-analysis
+meta_bats_info <- meta_bats
+```
+### Removing fragments more than 10,000 ha and also the study (ID 52) whose data was the same as another study to avoid duplication in the dataset.
+
+```{r}
+#Removing study that studied fragments with a size greater than 10,000 ha, as these are comparable to my definition of continuous forest
+meta_bats <-subset(meta_bats,Paper_ID!= 34)
+#Removing study that I have already used the data for from another paper: 
+meta_bats <-subset(meta_bats,Paper_ID!= 52)
+
+meta_bats %>%
+  filter(Fragment_size_ha > 11000) %>%
+  select(Paper_ID, UniqueFragID, Fragment_size_ha) %>%
+  distinct() 
+```
+
+### Subsetting species-level capture responses from other responses (i.e., species richness and total abundance)
+
+```{r}
+# Subsetting species-level capture responses
+species_data <- subset(meta_bats, Species != "TOTAL" & !is.na(lnRR_input))
+
+## Remove study × species × DataType combos that are zero everywhere 
+species_data <- species_data %>%
+  dplyr::group_by(Paper_ID, Species, DataType) %>%
+  dplyr::filter(sum(lnRR_input, na.rm = TRUE) > 0) %>%  # keep only if seen at least once
+  dplyr::ungroup()
+
+## Split by group (Paper × DataType × Species)
+grouped <- split(
+  species_data,
+  list(species_data$Paper_ID, species_data$DataType, species_data$Species)
+)
+head(species_data)
+## Initialise results list 
+results <- list()
+```
+
+### Define a global epsilon and create SiteUID for each unique site (Paper × Latitude × Longitude) to track which observations come from the same site, and to ensure that we are not comparing a site to itself in the meta-analysis.
+
+```{r}
+# Smallest positive value in the dataset, halved:
+eps <- min(species_data$lnRR_input[species_data$lnRR_input > 0], na.rm = TRUE) / 2
+
+#sensitivity analysis: I wil then incorporate these into new lnrr caluclations.
+eps1_2 <- eps / 2      # half the current epsilon
+eps2   <- eps * 2      # double the current epsilon
+
+# Ensuring structure is correct: 
+species_data <- species_data %>%
+  mutate(
+    UniqueFragID = as.character(UniqueFragID),
+    Treatment    = as.character(Treatment),
+    Paper_ID     = as.integer(Paper_ID)
+  )
+
+  #Mark continuous rows and give each continuous site a deterministic index
+species_data <- species_data %>%
+  group_by(Paper_ID) %>%
+  mutate(
+    .is_cont = is.na(UniqueFragID) | UniqueFragID == "",
+    .cont_index = if_else(.is_cont, cumsum(.is_cont), NA_integer_)
+  ) %>%
+  ungroup()
+
+#add in SiteUID
+species_data <- species_data %>%
+  mutate(
+    Paper_ID = as.integer(Paper_ID),
+    Treatment = as.character(Treatment),
+    UniqueFragID = as.character(UniqueFragID)
+  ) %>%
+  group_by(Paper_ID) %>%
+  mutate(
+    # continuous rows get indexed per paper
+    cont_index = if_else(
+      Treatment == "Cont",
+      dense_rank(paste(Latitude, Longitude, Unique_name)),
+      NA_integer_
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    SiteUID = case_when(
+      Treatment == "Frag" ~ paste0("Frag__", UniqueFragID),
+      Treatment == "Cont" ~ paste0("Cont__", Paper_ID, "__", cont_index)
+    )
+  )
+
+```
+
+### Collapsing species rows into one row per species per site to avoid duplicated that could have arisen from assigning SiteUID.
+
+```{r}
+#Ensuring no duplicates in species_sites keys; joining back shouldn't change row count
+# record before
+n_before <- nrow(species_data)
+
+
+# Collapse to one row per Paper×SiteUID×Species 
+species_data_raw <- species_data   # keep full trait table here
+
+species_site_collapsed <- species_data %>%
+  group_by(Paper_ID, SiteUID, Species) %>%
+  summarise(
+    Treatment = first(Treatment),
+    Response = sum(as.numeric(Response), na.rm = TRUE),
+    Mist_net_hours = sum(as.numeric(Mist_net_hours), na.rm = TRUE),
+    Rate = ifelse(Mist_net_hours > 0, Response / Mist_net_hours, 0),
+    Sample_size_sum = sum(as.numeric(Sample_size), na.rm = TRUE),
+    UniqueFragID = first(UniqueFragID),
+    Fragment_size_ha = first(Fragment_size_ha),
+    Latitude = first(Latitude),
+    Longitude = first(Longitude),
+    Matrix_mean = first(Matrix_mean),
+    Forest_Group = first(Forest_Group),
+    Country = first(Country),
+    Rainfall_mm = first(Rainfall_mm),
+    Elevation = first(Elevation),
+    .groups = "drop"
+  )
+
+species_data <- species_site_collapsed
+
+
+#as a resultof this collapse, the data went from 6850 observations, to 5768 observations, 
+# show the names and the first rows
+names(species_data)
+
+```
+### Cleaning this species dataframe, by removing "species" that are not actually species (i.e., those that contain letters in the Species column, which are likely to be higher taxonomic levels or unidentified species). Additionally, assigning diet, habitat affinity to species where this is left blank. 
+```{r}
+# Vector of species to exclude
+species_to_remove <- c( "Artibeus sp.", "Dermanura sp.", "Doryrhina camerunensis",
+                        "Eptesicus brasiliensis/chiriquinus", "Eptesicus sp.", 
+                        "Lasiurus cf. blosevilli", "Lichonycteris degener", "Ozimops planiceps",
+                        "Tonatia maresi", "Rhogeesa tumida/io", "micronycteris sp.","Micronycteris sp.",
+  "Glossophaga sp.",
+  "Nyctophilus sp.",
+  "Peropteryx sp.",
+  "Carollia sp.",
+  "Miniopterus cf. inflatus",
+  "Myotis sonotype 1",
+  "Eumops sp.",
+  "Sturnira sp.",
+  "Tonatia sp.",
+  "Myotis nsp.",
+  "Pteronotus sp.",
+  "MYCA/MYYU",
+  "MYLU/MYVO",
+  "MYEV/MYTH",
+  "EPFU/LANO",
+  "Miniopterus gleni/M.majori",
+  "Mo1", "Anoura sp.", "Glossophaga",
+  "Otomops madagascariensis/Tadarida fulminans",
+  "Scotophilus robustus/Miniopterus gleni",
+  "Scotophilus robustus/Mormopterus jugularis",
+  "VMi1",
+  "Vampyressa sp.","micronycteris sp.",
+  "Miniopterus fuliginosus/Pipistrellus abramus",
+  "Murina leucogaster/ Harpiocephalus harpia",
+  "Rhinolophus pearsonii/ R. macrotis",
+  "Nyctalus plancyi, Eptesicus pachyomus, Vespertilio sinensis",
+  "Chaerephon plicatus,  Taphozous melanopogon",
+  "Myotis altarium, M. chinensis, M. fimbriatus, M. laniger, M. pilosus",
+  "Rhinolophus affinis,  R. ferrumequinum, R. sinicus", "Syconycteris sp."
+)
+
+#removing these: 
+species_data <- species_data %>%
+  mutate(Species = as.character(Species))
+
+species_data <- species_data %>%
+  filter(!Species %in% species_to_remove)
+
+species_data_raw <- species_data_raw %>%
+  mutate(Species = as.character(Species)) %>%
+  filter(!Species %in% species_to_remove)
+
+
+#Gather the traits that we want to carry through to this df: 
+# list the traits you want (adjust names if needed)
+trait_cols <- c(
+  "Species",
+  "Family",
+  "Diet",
+  "Trophic_level",
+  "Habitat_affinity_new",
+  "Foraging_strat",
+  "FA_length",
+  "Averagemass_g",
+  "Aspect_ratio",
+  "Wing_loading",
+  "Strata",
+  "Call_type",
+  "Conservation_status"
+)
+
+
+# find which of the requested columns actually exist in species_data
+# build trait table from the raw table
+
+found_cols <- intersect(trait_cols, names(species_data_raw))
+numeric_candidates <- found_cols[
+found_cols != "Species" &
+sapply(species_data_raw[found_cols], is.numeric)
+]
+
+char_candidates <- setdiff(
+  found_cols[found_cols != "Species"],
+  numeric_candidates
+)
+
+species_traits_df <- species_data_raw %>%
+  select(any_of(c("Species", setdiff(trait_cols, "Species")))) %>%
+  group_by(Species) %>%
+  summarise(
+    across(all_of(numeric_candidates),
+           ~ if (all(is.na(.x))) NA_real_ else median(.x, na.rm = TRUE)),
+    across(all_of(char_candidates),
+           ~ { v <- na.omit(.x); if (length(v)) as.character(v[1]) else NA_character_ }),
+    .groups = "drop"
+  )
+
+colnames(species_traits_df)
+colnames(species_data)
+```
+### Joining this trait information back to the species-level dataset, and ensuring that we have one row per species per site, so that we can calculate lnRR values for each species at each site without duplication.
+
+```{r}
+#joining
+species_data2 <- species_data %>%
+  mutate(Species = as.character(Species))
+
+species_traits2 <- species_traits_df %>%
+  mutate(Species = as.character(Species))
+
+# decide which trait columns would collide with meta_species
+trait_cols <- setdiff(names(species_traits2), "Species")
+collide <- intersect(trait_cols, names(species_data2))
+new_only <- setdiff(trait_cols, collide)
+
+# prepare a safe trait table to join:
+#    - keep columns that don't exist in meta_species as-is
+#    - for columns that do exist, add them with suffix "_trait"
+if (length(collide) > 0) {
+  species_traits_safe <- species_traits2 %>%
+    transmute(
+      Species,
+      !!!rlang::set_names(new_only, new_only),                          # keep new-only names
+      !!!rlang::set_names(collide, paste0(collide, "_trait"))            # rename collisions -> _trait
+    )
+  # actually build those columns programmatically in case none/new_only empty
+  left_cols <- c("Species")
+  if (length(new_only) > 0) left_cols <- c(left_cols, new_only)
+  if (length(collide) > 0) left_cols <- c(left_cols, paste0(collide, "_trait"))
+  # re-create species_traits_safe reliably:
+  species_traits_safe <- species_traits2 %>%
+    { tmp <- .;
+    out <- tibble(Species = tmp$Species)
+    if (length(new_only) > 0) out <- bind_cols(out, tmp %>% select(all_of(new_only)))
+    if (length(collide) > 0) {
+      renamed <- tmp %>% select(all_of(collide))
+      names(renamed) <- paste0(names(renamed), "_trait")
+      out <- bind_cols(out, renamed)
+    }
+    out
+    }
+} else {
+  species_traits_safe <- species_traits2
+}
+
+# left_join (preserve meta_species rows order)
+meta_species_joined <- species_data2 %>%
+  left_join(species_traits_safe, by = "Species")
+
+site_meta <- species_data_raw %>%
+  select(
+    Paper_ID,
+    UniqueFragID,
+    Species,
+    Matrix,
+    Forest_type
+  ) %>%
+  distinct(Paper_ID, UniqueFragID, Species, .keep_all = TRUE)
+
+meta_species_joined <- meta_species_joined %>%
+  left_join(
+    site_meta,
+    by = c("Paper_ID", "UniqueFragID", "Species")
+  )
+
+
+#renaming
+meta_species<- meta_species_joined
+```
+
+### Inputting trophic level, diet  and habitat affinity information for species where this is missing, by using the family-level information for these species.
+
+```{r}
+# Identify species with missing Trophic_level or Diet
+missing_trophic <- meta_species %>% filter(is.na(Trophic_level))
+missing_diet <- meta_species %>% filter(is.na(Diet))
+
+# Assigning the trophic level for each species. 
+meta_species <- meta_species %>%
+  mutate(
+    Trophic_level = case_when(
+      Diet %in% c("Frugivore", "Nectarivore") ~ "Phytophagous",
+      Diet %in% c("Insectivore", "Carnivore", "Sanguivore",
+                  "Piscivore", "Omnivore") ~ "Animalivorous",
+      TRUE ~ Trophic_level
+    )
+  )
+
+# helper function to copy habitat from one species to another
+copy_habitat <- function(df, from_sp, to_sp) {
+  ref_val <- df$Habitat_affinity_new[df$Species == from_sp][1]
+  
+  if (is.na(ref_val)) return(df)  # skip if missing
+  
+  df$Habitat_affinity_new[df$Species == to_sp] <- ref_val
+  df
+}
+
+# Copy from closely related species or species with similar traits (e.g., same family, similar diet) to fill in missing habitat affinity where reasonably inferred.
+
+meta_species <- meta_species %>%
+  copy_habitat("Artibeus_jamaicensis_ott289157",
+               "Vampyrodes_caraccioli_ott269230") %>%
+  
+  copy_habitat("Artibeus_jamaicensis_ott289157",
+               "Centurio_senex_ott351782") %>%
+  
+  copy_habitat("Glossophaga_soricina_ott876514",
+               "Glossophaga_morenoi_ott227308") %>%
+  
+  copy_habitat("Saccopteryx_leptura_ott75192",
+               "Saccopteryx_canescens_ott232381") %>%
+  
+  copy_habitat("Sturnira_ludovici_ott136687",
+               "Sturnira_tildae_ott401295") %>%
+  
+  copy_habitat("Dermanura_watsoni_ott805986",
+               "Vampyressa_nymphaea_ott981726") %>%
+  
+  copy_habitat("Vampyrodes_caraccioli_ott269230",
+               "Vampyrodes_major_ott569768") %>%
+  
+  copy_habitat("Lophostoma_silvicolum_ott951266",
+               "Lophostoma_evotis_ott375137") %>%
+  
+  copy_habitat("Platyrrhinus_incarum_ott873032",
+               "Platyrrhinus_brachycephalus_ott295643") %>%
+  
+  copy_habitat("Platyrrhinus_incarum_ott873032",
+               "Platyrrhinus_recifinus_ott348438")
+
+
+meta_species <- meta_species %>%
+  mutate(
+    Habitat_affinity_new = case_when(
+      as.character(Species) %in% c("Noctilio_leporinus_ott604404",
+                                   "Noctilio_albiventris_ott604407") ~ "Water-adapted",
+      as.character(Species) == "Natalus_stramineus_ott579474" ~ "Clutter-adapted",
+      TRUE ~ as.character(Habitat_affinity_new)   # <- ensure character fallback
+    ),
+    Habitat_affinity_new = factor(Habitat_affinity_new)  # optional: back to factor
+  )
+
+meta_species <- meta_species %>%
+  copy_habitat("Artibeus_jamaicensis_ott289157",
+               "Vampyressa_nymphaea_ott981726")
+
+meta_species <- meta_species %>%
+  copy_habitat("Artibeus_jamaicensis_ott289157",
+               "Platyrrhinus_recifinus_ott348438")
+
+meta_species <- meta_species %>%
+  copy_habitat("Artibeus_jamaicensis_ott289157",
+               "Pygoderma_bilabiatum_ott894971")
+
+meta_species <- meta_species %>%
+  copy_habitat("Saccopteryx_canescens_ott232381",
+               "Emballonura_atrata_ott156176")
+
+meta_species <- meta_species %>%
+  copy_habitat("Platyrrhinus_recifinus_ott348438",
+               "Platyrrhinus_brachycephalus_ott295643")
+
+meta_species <- meta_species %>%
+  copy_habitat("Molossus_rufus_ott267993",
+               "Molossops_temminckii_ott633522")
+
+#assigning rhinolophus the clutter adapted: 
+meta_species$Habitat_affinity_new[
+  meta_species$Species %in% c(
+    "Rhinolophus_beddomei_ott994640",
+    "Rhinolophus_indorouxii_ott7067837",
+    "Rhinolophus_lepidus_ott217411",
+    "Rhinolophus_rouxii_ott1047994"
+  )
+] <- "Clutter-adapted"
+
+#Ensuring no typos
+meta_species_FC <- meta_species
+
+#reducing the number of levels in trophic level
+meta_species_FC$Trophic_level[meta_species_FC$Trophic_level=="animalivorous "] <- "Animalivorous"
+meta_species_FC$Trophic_level[meta_species_FC$Trophic_level=="animalivorous"] <- "Animalivorous"
+meta_species_FC$Trophic_level[meta_species_FC$Trophic_level==" animalivorous"] <- "Animalivorous"
+meta_species_FC$Trophic_level[meta_species_FC$Trophic_level=="phytophagous"] <- "Phytophagous"
+
+```
+
+### Ensuring structure is correct for species-level dataset
+
+```{r}
+factor_cols <- c(
+  "Species",
+  "Trophic_level",
+  "Forest_Group",
+  "Habitat_affinity_new",
+  "Matrix_mean",
+  "Conservation_status",
+  "Diet",
+  "Strata",
+  "Foraging_strat"
+)
+
+meta_species_FC <- meta_species_FC %>%
+  mutate(across(all_of(factor_cols), as.factor)) %>%
+  mutate(across(all_of(factor_cols), droplevels))
+
+
+#I'm going to put the Note evaluated species "NE" within the same category as Data deficient "DD". 
+meta_species_FC$Conservation_status[meta_species_FC$Conservation_status =="NE"] <- "DD"
+
+meta_species_FC$Conservation_status <- droplevels(meta_species_FC$Conservation_status)
+sapply(meta_species_FC[, c("Matrix_mean", "Forest_Group", "Conservation_status", "Trophic_level", "Foraging_strat", "Strata", "Diet")], nlevels)
+
+```
+```{r}
+### Writing this cleaned species-level dataset to a csv for later caluclation of lnRR values.
+```{r}
+# Write cleaned species-level data to CSV
+write_csv(meta_species_FC, "species_level_data_cleaned.csv")
+```
+
+### Calculating effect sizes for non-species too by subsetting data into three separate dataframes (one for SR, one for AB and one for ACT)
+
+```{r}
+#For SR and AB, I'm going to be pulling form totals of studies, where column Total == 1
+
+Totals <- meta_bats %>% filter(Total == 1)
+
+# papers to keep species for
+exceptions <- c(22, 42, 48, 54, 56)
+
+# filter:
+# - remove rows where Species contains any letters ([A-Za-z])
+# - but keep rows where Species == "TOTAL" or Paper_ID is in exceptions
+Totals_backup <- Totals %>%
+  # ensure Species is character to avoid factor issues
+  mutate(Species = as.character(Species)) %>%
+  filter(
+    # keep if Species is TOTAL OR Paper is in exceptions OR Species does NOT contain letters
+    Species == "TOTAL" |
+      Paper_ID %in% exceptions |
+      !grepl("[A-Za-z]", Species)
+  )
+
+Totals <- Totals_backup
+
+# Subset by DataType
+meta_SR  <- Totals %>% filter(DataType == "SR")
+meta_AB  <- Totals %>% filter(DataType == "AB")
+meta_ACT <- meta_bats %>% filter(DataType == "ACT")
+
+#Defining which colums I'm going to use as response for each data type.
+# SR uses 'Response'
+meta_SR <- meta_SR %>% mutate(Value = Response)
+
+# AB and ACT use 'Rate'
+meta_AB <- meta_AB %>% mutate(Value = Rate)
+meta_ACT <- meta_ACT %>% mutate(Value = Rate)
+```
+
+### Creating unique frag iDs for each of these response variables: 
+
+```{r}
+#creating site IUDs: 
+
+create_siteuid <- function(df) {
+  required_cols <- c("Paper_ID", "Treatment", "UniqueFragID",
+                     "Latitude", "Longitude", "Unique_name")
+  missing_cols <- setdiff(required_cols, names(df))
+  if (length(missing_cols) > 0) {
+    stop("Dataframe missing required columns: ", paste(missing_cols, collapse = ", "))
+  }
+  
+  df %>%
+    mutate(
+      Paper_ID = as.integer(Paper_ID),
+      Treatment = as.character(Treatment),
+      UniqueFragID = as.character(UniqueFragID),
+      # create a safe location key: prefer Latitude/Longitude/Unique_name, else fall back to row number
+      .loc_key = if_else(
+        !is.na(Latitude) & !is.na(Longitude) & !is.na(Unique_name),
+        paste0(Latitude, "__", Longitude, "__", Unique_name),
+        paste0("ROW__", Paper_ID, "__", row_number())
+      )
+    ) %>%
+    group_by(Paper_ID) %>%
+    mutate(
+      cont_index = if_else(
+        Treatment == "Cont",
+        dense_rank(.loc_key),
+        NA_integer_
+      )
+    ) %>%
+    ungroup() %>%
+    mutate(
+      SiteUID = case_when(
+        Treatment == "Frag" ~ paste0("Frag__", UniqueFragID),
+        Treatment == "Cont" ~ paste0("Cont__", Paper_ID, "__", cont_index),
+        TRUE ~ paste0("Other__", Paper_ID, "__", row_number())
+      )
+    ) %>%
+    select(-.loc_key)
+}
+
+# Applying this to my dataframes!
+
+meta_SR  <- create_siteuid(meta_SR)
+meta_AB  <- create_siteuid(meta_AB)
+meta_ACT  <- create_siteuid(meta_ACT)
+
+```
+
+### Ensuring one count per reponse variable per site: 
+
+```{r}
+# Collapse meta_SR (species richness / community counts)
+# -----------------------
+meta_SR_backup2 <- meta_SR
+
+meta_SR_collapsed <- meta_SR %>%
+  group_by(Paper_ID, SiteUID) %>%
+  summarise(
+    # aggregated responses / effort / sample sizes
+    Response = sum(as.numeric(Response), na.rm = TRUE),
+    Mist_net_hours = sum(as.numeric(Mist_net_hours), na.rm = TRUE),
+    Sample_size = sum(as.numeric(Sample_size), na.rm = TRUE),
+    # derived Rate (recompute to be consistent)
+    Rate = ifelse(Mist_net_hours > 0, Response / Mist_net_hours, NA_real_),
+    # keep representative metadata (first non-NA where possible)
+    Treatment = first(na.omit(Treatment)),
+    UniqueFragID = first(na.omit(UniqueFragID)),
+    Unique_name = first(na.omit(Unique_name)),
+    Fragment_size_ha = first(na.omit(Fragment_size_ha)),
+    Latitude = first(na.omit(Latitude)),
+    Longitude = first(na.omit(Longitude)),
+    Matrix_mean = first(na.omit(Matrix_mean)),
+    Forest_Group = first(na.omit(Forest_Group)),
+    Elevation = first(na.omit(Elevation)),
+    Rainfall_mm = first(na.omit(Rainfall_mm)),
+    
+    # Keep other useful fields as 'first' to preserve columns
+    Forest_type = first(na.omit(Forest_type)),
+    Country = first(na.omit(Country)),
+    Publication.Year = first(na.omit(Publication.Year)),
+    .groups = "drop"
+  )
+
+# Safety checks
+stopifnot(nrow(meta_SR_collapsed) <= nrow(meta_SR))  # should reduce or equal
+
+# Replace original object (use collapsed for lnRR)
+meta_SR <- meta_SR_collapsed
+
+# Collapse meta_AB (abundance / counts that use Rate)
+meta_AB_backup2 <- meta_AB
+colnames(meta_AB_backup2)
+meta_AB_collapsed <- meta_AB %>%
+  group_by(Paper_ID, SiteUID) %>%
+  summarise(
+    # AB may record raw counts (Response) and effort (Mist_net_hours)
+    Response = sum(as.numeric(Response), na.rm = TRUE),
+    Mist_net_hours = sum(as.numeric(Mist_net_hours), na.rm = TRUE),
+    Sample_size = sum(as.numeric(Sample_size), na.rm = TRUE),
+    # recompute rate consistently
+    Rate = ifelse(Mist_net_hours > 0, Response / Mist_net_hours, NA_real_),
+    # metadata kept as representative
+    Treatment = first(na.omit(Treatment)),
+    UniqueFragID = first(na.omit(UniqueFragID)),
+    Unique_name = first(na.omit(Unique_name)),
+    Rainfall_mm = first(na.omit(Rainfall_mm)),
+    Elevation = first(na.omit(Elevation)),
+    Matrix_mean = first(na.omit(Matrix_mean)),
+    Fragment_size_ha = first(na.omit(Fragment_size_ha)),
+    Latitude = first(na.omit(Latitude)),
+    Longitude = first(na.omit(Longitude)),
+    Forest_Group = first(na.omit(Forest_Group)),
+    Forest_type = first(na.omit(Forest_type)),
+    Country = first(na.omit(Country)),
+    Publication.Year = first(na.omit(Publication.Year)),
+    .groups = "drop"
+  )
+
+# Safety checks
+stopifnot(nrow(meta_AB_collapsed) <= nrow(meta_AB))
+
+# Replace original object (use collapsed for lnRR)
+meta_AB <- meta_AB_collapsed
+
+#Doing the same thing for ACT (acoustic activity)
+meta_ACT_backup2 <- meta_ACT
+colnames(meta_ACT_backup2)
+meta_ACT_collapsed <- meta_ACT %>%
+  group_by(Paper_ID, SiteUID) %>%
+  summarise(
+    # AB may record raw counts (Response) and effort (Mist_net_hours)
+    Response = sum(as.numeric(Response), na.rm = TRUE),
+    Mist_net_hours = sum(as.numeric(Mist_net_hours), na.rm = TRUE),
+    Sample_size = sum(as.numeric(Sample_size), na.rm = TRUE),
+    # recompute rate consistently
+    Rate = ifelse(Mist_net_hours > 0, Response / Mist_net_hours, NA_real_),
+    # metadata kept as representative
+    Treatment = first(na.omit(Treatment)),
+    UniqueFragID = first(na.omit(UniqueFragID)),
+    Unique_name = first(na.omit(Unique_name)),
+    Rainfall_mm = first(na.omit(Rainfall_mm)),
+    Elevation = first(na.omit(Elevation)),
+    Matrix_mean = first(na.omit(Matrix_mean)),
+    Fragment_size_ha = first(na.omit(Fragment_size_ha)),
+    Latitude = first(na.omit(Latitude)),
+    Longitude = first(na.omit(Longitude)),
+    Forest_Group = first(na.omit(Forest_Group)),
+    Forest_type = first(na.omit(Forest_type)),
+    Country = first(na.omit(Country)),
+    Publication.Year = first(na.omit(Publication.Year)),
+    .groups = "drop"
+  )
+
+  # 1) make a full backup 
+meta_SR_backup <- meta_SR
+
+```
+
+### Creating a function to create SiteUIDs while keeping original columns intact, and applying this function to all three dataframes (meta_SR, meta_AB, meta_ACT) to ensure consistent SiteUID creation across datasets.
+
+```{r}
+create_siteids_keep_originals <- function(df,
+                                          frag_id_col = "UniqueFragID",
+                                          treatment_col = "Treatment",
+                                          paper_col = "Paper_ID",
+                                          cont_paper_col = "Cont_Paper_ID",
+                                          cont_lat_col = "Cont_Latitude",
+                                          cont_lon_col = "Cont_Longitude",
+                                          cont_name_col = "Cont_SiteName",
+                                          existing_cont_col = "Cont_SiteUID") {
+  
+  if (!all(c(frag_id_col, treatment_col, paper_col) %in% names(df))) {
+    stop("One of frag/treatment/paper columns missing")
+  }
+  
+  # Work on a copy to avoid accidental column removal
+  base_df <- df
+  
+  # Frag SiteUID
+  frag_uid <- if_else(base_df[[treatment_col]] == "Frag" & !is.na(as.character(base_df[[frag_id_col]])),
+                      paste0("Frag__", as.character(base_df[[frag_id_col]])),
+                      NA_character_)
+  
+  # Cont loc key from available cont columns
+  cont_cols <- c(cont_paper_col, cont_lat_col, cont_lon_col, cont_name_col)
+  cont_inputs <- lapply(cont_cols, function(col) if (col %in% names(base_df)) base_df[[col]] else rep(NA, nrow(base_df)))
+  cont_loc_key <- pmap_chr(cont_inputs, function(paper, lat, lon, name) {
+    parts <- c(paper, lat, lon, name)
+    parts <- parts[!is.na(parts)]
+    if (length(parts) == 0) return(NA_character_)
+    parts <- as.character(parts)
+    parts <- str_replace_all(parts, "\\s+", "_")
+    paste(parts, collapse = "__")
+  })
+  
+  cont_generated <- if_else(!is.na(cont_loc_key), paste0("Cont__", cont_loc_key), NA_character_)
+  
+  # final Cont_SiteUID: prefer existing column if it is present
+  cont_final <- if (existing_cont_col %in% names(base_df)) {
+    coalesce(as.character(base_df[[existing_cont_col]]), cont_generated)
+  } else {
+    cont_generated
+  }
+  
+  # pooled_by_paper (compute counts)
+  pooled_by_paper <- tibble(
+    Paper_ID = base_df[[paper_col]],
+    frag_flag = base_df[[treatment_col]] == "Frag",
+    frag_id = as.character(base_df[[frag_id_col]]),
+    cont_uid = cont_final
+  ) %>%
+    group_by(Paper_ID) %>%
+    summarise(
+      n_frag = n_distinct(frag_id[frag_flag]),
+      n_distinct_cont = n_distinct(cont_uid[!is.na(cont_uid)]),
+      .groups = "drop"
+    )
+  
+  pooled_info <- left_join(tibble(Paper_ID = base_df[[paper_col]]), pooled_by_paper, by = "Paper_ID")
+  
+  # pooled flag logic 
+  pooled_flag <- if (existing_cont_col %in% names(base_df)) {
+    # detect existing pooled labels (if any) and/or single distinct cont per paper
+    existing_vals <- as.character(base_df[[existing_cont_col]])
+    is_existing_pooled <- !is.na(existing_vals) & str_starts(existing_vals, "Pooled_Cont__")
+    is_single_cont <- (pooled_info$n_frag > 0 & pooled_info$n_distinct_cont == 1)
+    ifelse(is_existing_pooled | is_single_cont, TRUE, FALSE)
+  } else {
+    is_single_cont <- (pooled_info$n_frag > 0 & pooled_info$n_distinct_cont == 1)
+    ifelse(is_single_cont, TRUE, FALSE)
+  }
+  
+  # assemble newcols tibble and preserve row order
+  newcols <- tibble(
+    SiteUID = frag_uid,
+    Cont_loc_key = cont_loc_key,
+    Cont_SiteUID_generated = cont_generated,
+    Cont_SiteUID = cont_final,
+    pooled_cont = pooled_flag
+  )
+  
+  # ensure no name clashes when binding (rename newcols if necessary)
+  clash <- intersect(names(newcols), names(base_df))
+  if (length(clash) > 0) {
+    names(newcols) <- paste0(names(newcols), "_new")
+  }
+  
+  # bind and return (original columns preserved exactly)
+  out <- bind_cols(base_df, newcols)
+  return(out)
+}
+
+meta_SR <- create_siteids_keep_originals(meta_SR)
+
+# 3) and meta_AB, )
+meta_AB <- create_siteids_keep_originals(meta_AB)
+
+#AND ACT
+
+meta_ACT <- create_siteids_keep_originals(meta_ACT)
+```
+
+### Write csvs of these cleaned dataframes for later computation of lnRR values. 
+
+```{r}
+write_csv(meta_SR, "meta_SR_cleaned.csv")
+write_csv(meta_AB, "meta_AB_cleaned.csv")
+write_csv(meta_ACT, "meta_ACT_cleaned.csv")
+```
