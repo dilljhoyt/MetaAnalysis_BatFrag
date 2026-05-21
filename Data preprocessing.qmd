@@ -9,9 +9,6 @@ library(readr)
 library(stringr)
 library(purrr)
 
-#setting working directory: 
-setwd("/Users/dillanhoyt/Documents/PhD/Meta Analysis/Statistics/Meta Analysis")
-
 # Load the dataset
 meta_bats <- read.csv("MetaAnalysis_updated_withZeros.csv")
 ```
