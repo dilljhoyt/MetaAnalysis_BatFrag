@@ -9,10 +9,10 @@ libs <- c(
 invisible(lapply(libs, library, character.only = TRUE))
 
 #insert csv: 
-meta_SR <- read.csv("/Users/dillanhoyt/Documents/PhD/Meta Analysis/Statistics/Meta Analysis/effect_size_totalSR.csv")
+meta_SR <- read.csv("effect_size_totalSR.csv")
 
 #inserting phylogenetic correlation matrix: 
-phylo_cor <- readRDS("/Users/dillanhoyt/Documents/PhD/Meta Analysis/Statistics/Meta Analysis/phylo_cor_matrix.rds")
+phylo_cor <- readRDS("phylo_cor_matrix.rds")
 
 #removing any edge sites 
 meta_SR <- meta_SR %>%
@@ -100,18 +100,12 @@ meta_SR_FC <- meta_SR %>%
     lnRR_dir = ifelse(Treatment == "Cont", -lnRR, lnRR)
   )
 
-#gaussian
 m_SR_gaussian_FC  <- readRDS("model_sr_full_gaussian.rds")
 summary(m_SR_gaussian_FC); pp_check(m_SR_gaussian_FC) 
 
 #student t
 m_SR_studentt_FC  <- readRDS("model_sr_full_student.rds")
 summary(m_SR_studentt_FC); pp_check(m_SR_studentt_FC) 
-
-#loo compare both models
-loo_SR_landscape_gaussian_FC <- loo(m_SR_gaussian_FC)
-loo_SR_landscape_student_FC <- loo(m_SR_studentt_FC)
-loo_compare(loo_SR_landscape_gaussian_FC, loo_SR_landscape_student_FC)
 
 ```
 ### Subsetting data to only look at fragment - fragment comparisons and then running a Bayesian hierarchical model to look at the effect of landscape variables on species richness response to fragmentation:
@@ -199,10 +193,6 @@ summary(m_SR_gaussian_FF); pp_check(m_SR_gaussian_FF)
 ### Runnign a model with all data to look at the effect of fragment size on species richness response to fragmentation:
 
 ```{r}
- #relevelling so temperate is my reference:
- meta_SR_All$Forest_Group <- relevel(meta_SR_All$Forest_Group,
-                                     ref = "Temperate") 
-
 # Gaussian model using observation SE
 m_SR_gaussian_ALL  <- readRDS("m_sr_all_new.rds")
 summary(m_SR_gaussian_ALL); pp_check(m_SR_gaussian_ALL) 
@@ -211,4 +201,22 @@ summary(m_SR_gaussian_ALL); pp_check(m_SR_gaussian_ALL)
 m_SR_gaussian_ALL_interaction  <- readRDS("m_sr_all_randomeffect_andinteraction_new.rds")
 summary(m_SR_gaussian_ALL_interaction); pp_check(m_SR_gaussian_ALL_interaction) 
 
+#Funnel plots for each of my datasets (F-F, F-C and all data) to check for publication bias:
+ggplot(meta_SR_FC, aes(x = se_obs, y = lnRR)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(x = "Standard Error (se_obs)", y = "Effect Size (lnRR)") +
+  theme_minimal()
+
+ggplot(meta_SR_FF, aes(x = se_obs, y = lnRR)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(x = "Standard Error (se_obs)", y = "Effect Size (lnRR)") +
+  theme_minimal()
+
+ggplot(meta_SR_All, aes(x = se_obs, y = lnRR)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(x = "Standard Error (se_obs)", y = "Effect Size (lnRR)") +
+  theme_minimal()
 ```
