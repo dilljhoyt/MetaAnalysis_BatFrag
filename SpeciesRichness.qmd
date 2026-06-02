@@ -1,3 +1,16 @@
+---
+title: "Species Richness - Meta Analysis "
+subtitle: "Analyzing the effect of fragmentation on species richness from capture data and how this is influenced by landscape variables"
+author: "Dillan Hoyt"
+execute: 
+  eval: true
+  echo: false
+  message: false
+editor: visual
+toc: true
+toc-depth: 3
+toc-title: Contents
+---
 ```{r}
 libs <- c(
   "brms", "projpred", "tidybayes", "bayesplot", "emmeans",
@@ -10,9 +23,6 @@ invisible(lapply(libs, library, character.only = TRUE))
 
 #insert csv: 
 meta_SR <- read.csv("effect_size_totalSR.csv")
-
-#inserting phylogenetic correlation matrix: 
-phylo_cor <- readRDS("phylo_cor_matrix.rds")
 
 #removing any edge sites 
 meta_SR <- meta_SR %>%
