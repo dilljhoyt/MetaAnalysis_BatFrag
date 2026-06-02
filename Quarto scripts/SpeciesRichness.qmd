@@ -1,0 +1,232 @@
+---
+title: "Species Richness - Meta Analysis "
+subtitle: "Analyzing the effect of fragmentation on species richness from capture data and how this is influenced by landscape variables"
+author: "Dillan Hoyt"
+execute: 
+  eval: true
+  echo: false
+  message: false
+editor: visual
+toc: true
+toc-depth: 3
+toc-title: Contents
+---
+```{r}
+libs <- c(
+  "brms", "projpred", "tidybayes", "bayesplot", "emmeans",
+  "posterior", "performance", "loo", "car", "dplyr",
+  "tidyr", "tibble", "forcats", "ggplot2", "ggdist",
+  "ggcorrplot", "scales", "patchwork", "corrr"
+)
+
+invisible(lapply(libs, library, character.only = TRUE))
+
+#insert csv: 
+meta_SR <- read.csv("effect_size_totalSR.csv")
+
+#removing any edge sites 
+meta_SR <- meta_SR %>%
+  dplyr::filter(!grepl("Edge", UniqueFragID))
+
+#removing fragments greater than 10,000ha 
+meta_species <-subset(meta_SR,Paper_ID!= 34)
+#removing repetitions (the same data was included twice by accident)
+meta_species <-subset(meta_SR,Paper_ID!= 52)
+#removing fragment over 10,000
+meta_SR %>%
+  filter(Fragment_size_ha > 11000) %>%
+  select(Paper_ID, UniqueFragID, Fragment_size_ha) %>%
+  distinct() 
+```
+### Ensuring structure is correct: 
+
+```{r}
+# Conservative floor for tiny variances
+vi_floor <- 0.2
+
+# Build analysis data with correct sample-size columns
+meta_SR2 <- meta_SR %>%
+  mutate(
+    # make sure these are numeric
+    nt = as.numeric(Sample_size),
+    
+    # use the correct partner sample size depending on comparison type
+    nc = case_when(
+      Comparison == "Frag_vs_Cont" ~ as.numeric(Cont_Sample_size_sum),
+      Comparison == "Frag_vs_Frag" ~ as.numeric(Partner_Sample_size_sum),
+      TRUE ~ NA_real_
+    ),
+    
+    # replace missing / zero values with a small placeholder
+    nt_fix = if_else(is.na(nt) | nt <= 0, 0.5, nt),
+    nc_fix = if_else(is.na(nc) | nc <= 0, 0.5, nc),
+    
+    # sampling variance
+    vi_raw = 1 / nt_fix + 1 / nc_fix,
+    vi = pmax(vi_raw, vi_floor),
+    se_obs = sqrt(vi)
+  ) %>%
+  filter(is.finite(vi) & vi > 0)
+
+# Create a consistently oriented effect size for plotting
+meta_SR2 <- meta_SR2 %>%
+  mutate(
+    Comparison = case_when(
+      is.na(Comparison) & !is.na(Treatment) & Treatment == "Frag" ~ "Frag_vs_Cont",
+      TRUE ~ Comparison
+    ),
+    lnRR_for_plot = case_when(
+      Comparison == "Frag_vs_Cont" ~ lnRR,
+      Comparison == "Cont_vs_Frag" ~ -lnRR,
+      Comparison == "Frag_vs_Frag" ~ -lnRR,
+      TRUE ~ lnRR
+    )
+  )
+
+# Final analysis dataset
+meta_SR <- meta_SR2
+
+#scaling everything: 
+meta_SR <- meta_SR %>%
+  mutate(
+    Elevation_s      = as.numeric(scale(Elevation)),
+    Rainfall_mm_s    = as.numeric(scale(Rainfall_mm)),
+    Latitude_s       = as.numeric(scale(Latitude)),
+    Longitude_s      = as.numeric(scale(Longitude)),
+    Fragment_size_ha_s = as.numeric(scale(Fragment_size_ha))
+  )
+
+  #before running models
+options(mc.cores = parallel::detectCores())
+```
+### Subsetting data to only look at continuous forest - fragment comparisons and then running a Bayesian hierarchical model to look at the effect of landscape variables on species richness response to fragmentation:
+
+```{r}
+meta_SR_FC <- meta_SR %>%
+  # keep only Frag vs Cont contrasts
+  filter(Comparison %in% c("Frag_vs_Cont", "Cont_vs_Frag")) %>%
+  # orient so all effects mean "fragment relative to continuous"
+  mutate(
+    lnRR_dir = ifelse(Treatment == "Cont", -lnRR, lnRR)
+  )
+
+m_SR_gaussian_FC  <- readRDS("model_sr_full_gaussian.rds")
+summary(m_SR_gaussian_FC); pp_check(m_SR_gaussian_FC) 
+
+#student t
+m_SR_studentt_FC  <- readRDS("model_sr_full_student.rds")
+summary(m_SR_studentt_FC); pp_check(m_SR_studentt_FC) 
+
+```
+### Subsetting data to only look at fragment - fragment comparisons and then running a Bayesian hierarchical model to look at the effect of landscape variables on species richness response to fragmentation:
+
+```{r}
+meta_SR_FF <- meta_SR %>%
+filter(Comparison == "Frag_vs_Frag") %>%
+  mutate(
+    size_small = Fragment_size_ha,   # the smaller of the pair (from your construction)
+    log_size_small = log(size_small)
+  ) %>%
+  filter(is.finite(log_size_small)) #creating a logged number that is the smallest fragment of the two being compared, because the size of the smaller fragment is the variable that changes between comparisons — the large fragment just acts as a reference.
+
+#scaling log_size_small: 
+ meta_SR_FF <- meta_SR_FF %>%
+  mutate(log_size_small_s = as.numeric(scale(log_size_small)))
+
+#gaussian
+m_SR_gaussian_FF  <- readRDS("m_SR_FF_new.rds")
+summary(m_SR_gaussian_FF); pp_check(m_SR_gaussian_FF) 
+
+```
+### Assigning continuous forest the value of 10,000ha and then running a model with all data to look at the effect of fragment size on species richness response to fragmentation:
+
+```{r}
+#applying a 10,000 ha cap on continuous forests
+ cf_area_ha <- 10000  # conventional area assigned to continuous forest
+ 
+ meta_SR_All <- meta_SR %>%
+   mutate(
+     .orig_comp = Comparison,
+     
+     # Standardise comparison labels only.
+     # No lnRR sign changes are made here.
+     Comparison = case_when(
+       .orig_comp %in% c("Frag_vs_Frag", "Frag_vs_Cont") ~ .orig_comp,
+       .orig_comp == "Cont_vs_Frag" ~ "Frag_vs_Cont",
+       TRUE ~ NA_character_
+     ),
+     
+     # Make area columns numeric
+     Fragment_size_ha = as.numeric(Fragment_size_ha),
+     Partner_Fragment_size_ha = as.numeric(Partner_Fragment_size_ha),
+     Cont_Fragment_size_ha = as.numeric(Cont_Fragment_size_ha)
+   ) %>%
+   
+   # Keep only recognised contrast types
+   filter(!is.na(Comparison)) %>%
+   
+   mutate(
+     # Define the moderator as the area of the less fragmented habitat
+     # F-F: larger of the two fragment areas
+     # C-F: continuous forest = 10,000 ha
+     forest_area_ref_ha = case_when(
+       Comparison == "Frag_vs_Frag" ~ pmax(Fragment_size_ha, Partner_Fragment_size_ha, na.rm = TRUE),
+       Comparison == "Frag_vs_Cont" ~ cf_area_ha,
+       TRUE ~ NA_real_
+     ),
+     
+     # Replace non-finite values
+     forest_area_ref_ha = if_else(is.finite(forest_area_ref_ha), forest_area_ref_ha, NA_real_),
+     
+     # Log-transform and scale
+     log_forest_area_ref   = log(forest_area_ref_ha),
+     log_forest_area_ref_s = as.numeric(scale(log_forest_area_ref))
+   ) %>%
+   
+   # Drop rows that still lack a usable moderator
+   filter(is.finite(log_forest_area_ref)) %>%
+   
+   # Remove helper column
+   select(-.orig_comp)
+ 
+ 
+ meta_SR_All <- meta_SR_All %>%
+   mutate(
+     log_size_small = case_when(
+       Comparison == "Frag_vs_Frag" ~ log(pmin(Fragment_size_ha, Partner_Fragment_size_ha)),
+       Comparison == "Frag_vs_Cont" ~ log(Fragment_size_ha),
+       TRUE ~ NA_real_
+     ),
+     log_size_small_s = as.numeric(scale(log_size_small))
+   )
+```
+### Runnign a model with all data to look at the effect of fragment size on species richness response to fragmentation:
+
+```{r}
+# Gaussian model using observation SE
+m_SR_gaussian_ALL  <- readRDS("m_sr_all_new.rds")
+summary(m_SR_gaussian_ALL); pp_check(m_SR_gaussian_ALL) 
+
+#adding an interaction term with area and comparison type 
+m_SR_gaussian_ALL_interaction  <- readRDS("m_sr_all_randomeffect_andinteraction_new.rds")
+summary(m_SR_gaussian_ALL_interaction); pp_check(m_SR_gaussian_ALL_interaction) 
+
+#Funnel plots for each of my datasets (F-F, F-C and all data) to check for publication bias:
+ggplot(meta_SR_FC, aes(x = se_obs, y = lnRR)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(x = "Standard Error (se_obs)", y = "Effect Size (lnRR)") +
+  theme_minimal()
+
+ggplot(meta_SR_FF, aes(x = se_obs, y = lnRR)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(x = "Standard Error (se_obs)", y = "Effect Size (lnRR)") +
+  theme_minimal()
+
+ggplot(meta_SR_All, aes(x = se_obs, y = lnRR)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(x = "Standard Error (se_obs)", y = "Effect Size (lnRR)") +
+  theme_minimal()
+```
