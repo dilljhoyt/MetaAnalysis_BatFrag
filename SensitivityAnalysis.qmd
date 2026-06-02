@@ -1,3 +1,16 @@
+---
+title: "Sensitivity Tests - Meta Analysis "
+subtitle: "Conducting sensitivity tests on epsilon choice and continuous forest size assumptions"
+author: "Dillan Hoyt"
+execute: 
+  eval: true
+  echo: false
+  message: false
+editor: visual
+toc: true
+toc-depth: 3
+toc-title: Contents
+---
 #load packages: 
 
 ```{r}
