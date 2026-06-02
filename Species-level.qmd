@@ -1,5 +1,6 @@
 ---
 title: "Species Level Meta Analysis "
+subtitle: "Analyzing the effect of fragmentation on species-level abundance from capture data through investigating how traits such as body mass, diet, habitat affinity and conservation status influence species responses to fragmentation"
 author: "Dillan Hoyt"
 execute: 
   eval: true
@@ -312,11 +313,11 @@ summary(m_batTraits_species.forag_habitat_CF) #No real patterns emerging here
 
 ```{r}
 # Body mass and diet interaction model for fragment–continuous dataset:
-m_batTraits_species.student_CF_bodymassDiet <- readRDS("m_batTraits_species.student_CF_bodymassDiet_new")
+m_batTraits_species.student_CF_bodymassDiet <- readRDS("m_batTraits_species.student_CF_bodymassDiet_new.rds")
 summary(m_batTraits_species.student_CF_bodymassDiet) #No real patterns emerging here
 
 # Body mass and habitat affinity interaction model for fragment–continuous dataset:
-m_batTraits_species.bodymass_HabitatInt_CF <- readRDS("m_batTraits_species.student_CF_StrataDiet")
+m_batTraits_species.bodymass_HabitatInt_CF <- readRDS("m_batTraits_species.student_CF_StrataDiet.rds")
 summary(m_batTraits_species.bodymass_HabitatInt_CF) #No real patterns emerging here
 
 ```
