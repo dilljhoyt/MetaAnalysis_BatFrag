@@ -1,3 +1,15 @@
+---
+title: "Species Level Meta Analysis "
+author: "Dillan Hoyt"
+execute: 
+  eval: true
+  echo: false
+  message: false
+editor: visual
+toc: true
+toc-depth: 3
+toc-title: Contents
+---
 ### This script analyses species-level bat responses to forest fragmentation using phylogenetically informed Bayesian hierarchical meta-analysis. Responses are partitioned into fragment–continuous forest (F–C) and fragment–fragment (F–F) contrasts, alongside unified models that explicitly test the effects of comparison context. The workflow integrates ecological traits, habitat affinity, diet, conservation status and landscape context while accounting for study-level dependence and phylogenetic non-independence through multilevel random effects and phylogenetic covariance matrices. 
 
 ```{r}
@@ -238,7 +250,7 @@ AIC(lm_FA, lm_BM) #choosing  bodymass over FA length based on lower AIC and inte
 
 ```{r}
 #Reading in the model fitted with a Gaussian error distribution for the fragment–continuous dataset:    
-m_batTraits_species.gaussian_CF <- readRDS("m_batTraits_species.gaussian_CF_NEW.rds")
+m_batTraits_species.gaussian_CF <- readRDS("m_batTraits_species.gaussian_CF.rds")
 
 summary(m_batTraits_species.gaussian_CF); pp_check(m_batTraits_species.gaussian_CF)
 
@@ -247,7 +259,7 @@ summary(m_batTraits_species.gaussian_CF); pp_check(m_batTraits_species.gaussian_
 
 ```{r}
 #Reading in the model fitted with a Student's t error distribution for the fragment–continuous dataset:
-m_batTraits_species.student_CF <- readRDS("m_batTraits_species.student_CF_NEW.rds")
+m_batTraits_species.student_CF <- readRDS("m_batTraits_species.student_CF.rds")
 
 summary(m_batTraits_species.student_CF); pp_check(m_batTraits_species.student_CF)
 
@@ -261,7 +273,7 @@ print(model_comparison)
 
 # Assess estimated degrees of freedom (nu)
 VarCorr(m_batTraits_species.gaussian_CF)
-posterior_summary(m_batTraits_species.student_CF, variable = "nu") #extremely heavy-tailed distribution, siggesting that Gaussian is the better fit for the data.
+posterior_summary(m_batTraits_species.student_CF, variable = "nu") #extremely heavy-tailed distribution, suggetsing that Student's t is the better fit for the data.
 
 ```
 ###Assessing how much variance is explained by the phylogenetic random effect in the best-fitting model for the fragment–continuous dataset by calculating the phylogenetic heritability (H²) using the variance components from the model summary.
@@ -328,8 +340,8 @@ meta_species_FF <- meta_species_FF %>%
 
 ```{r}
 #Loading in the model fitted with a Gaussian error distribution for the fragment–fragment dataset:
-m_batTraits_species.gaussian_FF_new <- readRDS("m_batTraits_species.gaussian_FF_new.rds")
-summary(m_batTraits_species.gaussian_FF_new); pp_check(m_batTraits_species.gaussian_FF_new) 
+m_batTraits_species.student_FF_new <- readRDS("m_batTraits_species.student_FF_new.rds")
+summary(m_batTraits_species.student_FF_new); pp_check(m_batTraits_species.student_FF_new) 
 
 
 ```
@@ -408,14 +420,14 @@ meta_species_All <- meta_species %>%
 # Fit a phylogenetically informed Bayesian hierarchical model with Contrast type as fixed effect: 
 
 ```{r}
-m_batTraits_species.gaussian_ALL_NEW <- readRDS("m_batTraits_species.gaussian_ALL_NEW.rds")
-summary(m_batTraits_species.gaussian_ALL_NEW); pp_check(m_batTraits_species.gaussian_ALL_NEW)
+m_batTraits_species.student_ALL_NEW <- readRDS("m_batTraits_species.student_ALL_new_NEW.rds")
+summary(m_batTraits_species.student_ALL_NEW)
 ```
 ### Fit model to allow species to differ in their responses between fragment–continuous and fragment–fragment contrasts by including a species-level random slope for Comparison nested within the phylogenetic covariance structure.
 
 ```{r}
-m_stable_uncor1 <- readRDS("m_batTraits_species.uncorr1_gaussian.rds")
-summary(m_stable_uncor1); pp_check(m_stable_uncor1)
+m_stable_uncor1 <- readRDS("m_batTraits_species.uncorr1_student.rds")
+summary(m_stable_uncor1)
 
 ```
 ### Funnel plot to check for publication bias in the fragment–continuous dataset by plotting the effect sizes (lnRR) against their standard errors (se_obs) and adding a reference line at lnRR = 0.
