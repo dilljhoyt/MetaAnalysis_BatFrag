@@ -1,0 +1,227 @@
+---
+title: "Total Abundance - Meta Analysis "
+subtitle: "Analyzing the effect of fragmentation on total abundance from capture data and how this is influenced by landscape variables"
+author: "Dillan Hoyt"
+execute: 
+  eval: true
+  echo: false
+  message: false
+editor: visual
+toc: true
+toc-depth: 3
+toc-title: Contents
+---
+### In this file, we are analyzing the total abundance data. The structure of the code is similar to the species richness file, but with some adjustments for the different response variable and potentially different covariates.
+
+```{r}
+libs <- c(
+  "brms", "projpred", "tidybayes", "bayesplot", "emmeans",
+  "posterior", "performance", "loo", "car", "dplyr",
+  "tidyr", "tibble", "forcats", "ggplot2", "ggdist",
+  "ggcorrplot", "scales", "patchwork", "corrr"
+)
+
+invisible(lapply(libs, library, character.only = TRUE))
+
+#insert csv:
+meta_AB <- read.csv("effect_size_totalabundance.csv")
+
+#removing any edge sites 
+meta_AB <- meta_AB %>%
+  dplyr::filter(!grepl("Edge", UniqueFragID))
+
+#setting correct structure: 
+meta_AB$Forest_Group <- as.factor(meta_AB$Forest_Group)
+meta_AB$Matrix_mean <- as.factor(meta_AB$Matrix_mean)
+
+# Setting weight
+vi_floor <- 0.2
+
+#Make a tiny lookup of fragment -> sample size (use existing names)
+frag_sizes <- meta_AB %>%
+  select(UniqueFragID_site, Sample_size) %>%
+  distinct()
+
+#Join partner sample size (partner ID may be NA for pooled controls)
+meta_AB <- meta_AB %>%
+  left_join(frag_sizes,
+            by = c("Partner_UniqueFragID" = "UniqueFragID_site"),
+            suffix = c("", ".partner"))
+
+#creating sample size columns for variance calculation
+meta_AB <- meta_AB %>%
+  mutate(
+    nt_raw = Sample_size,                # focal (this dataset's site-level sample size)
+    nc_raw = Sample_size.partner,        # partner sample size (joined)
+    nt = as.numeric(nt_raw),
+    nc = as.numeric(nc_raw)
+  )
+
+meta_AB <- meta_AB %>%
+  mutate(
+    nt_fix = ifelse(is.na(nt) | nt <= 0, 0.5, nt),
+    nc_fix = ifelse(is.na(nc) | nc <= 0, 0.5, nc),
+    vi_raw = 1 / nt_fix + 1 / nc_fix,
+    vi = pmax(vi_raw, vi_floor),   # floor to prevent tiny variances
+    se_obs = sqrt(vi)
+  )
+
+mod_data <- meta_AB %>% filter(is.finite(vi) & vi > 0)
+
+#consistently orienting lnRR so positive means higher abundance in continuous forests 
+meta_AB <- meta_AB %>%
+  mutate(
+    Comparison = if ("Comparison" %in% names(.)) Comparison else NA_character_,
+    # safe normalisation of comparison names if needed
+    Comparison = dplyr::case_when(
+      !is.na(Comparison) ~ Comparison,
+      !is.na(Treatment) & Treatment == "Frag" ~ "Frag_vs_Cont",
+      TRUE ~ Comparison
+    ),
+    lnRR_for_plot = case_when(
+      Comparison == "Frag_vs_Cont" ~ lnRR,     # frag / cont -> positive means fragment > continuous
+      Comparison == "Cont_vs_Frag" ~ -lnRR,    # if you have inverse rows, flip
+      Comparison == "Frag_vs_Frag" ~ -lnRR,    # flip so + means larger fragment higher (consistent)
+      TRUE ~ lnRR                              # fallback (leave original)
+    )
+  )
+
+#removing paper 34 and 52
+meta_AB <-subset(meta_AB,Paper_ID!= 34)
+meta_AB <-subset(meta_AB,Paper_ID!= 52)
+
+```
+### Separating out the data for the different comparison types, and ensuring the structure is correct for modeling:
+
+```{r}
+#selecting only frag vs continuous
+meta_AB_FC <- meta_AB %>%
+  # keep only Frag vs Cont contrasts
+  filter(Comparison %in% c("Frag_vs_Cont", "Cont_vs_Frag")) %>%
+  # orient so all effects mean "fragment relative to continuous"
+  mutate(
+    lnRR_dir = ifelse(Treatment == "Cont", -lnRR, lnRR)
+  )
+
+#inserting model:
+#gaussian
+model_AB_full  <- readRDS("m_abundance_CF_gaussian_new.rds")
+summary(model_AB_full)
+
+#student t
+model_AB_full_student  <- readRDS("m_abundance_CF_student_new.rds")
+summary(model_AB_full_student)
+
+loo_ab_gaussian <- loo(model_AB_full)
+loo_ab_student <- loo(model_AB_full_student)
+loo_compare(loo_ab_gaussian, loo_ab_student)
+
+```
+# F-F comparisons: 
+
+```{r}
+meta_AB_FF <- meta_AB %>%
+  filter(Comparison == "Frag_vs_Frag") %>%
+  mutate(
+    size_small = Fragment_size_ha,   # the smaller of the pair (from your construction)
+    log_size_small = log(size_small)
+  ) %>%
+  filter(is.finite(log_size_small)) #creating a logged number that is the smallest fragment of the two being compared, because the size of the smaller fragment is the variable that changes between comparisons — the large fragment just acts as a reference.
+
+#scaling log_size_small: 
+meta_AB_FF <- meta_AB_FF %>%
+  mutate(log_size_small_s = as.numeric(scale(log_size_small)))
+
+model_AB_fragfrag_full  <- readRDS("m_abundance_FF_new.rds")
+summary(model_AB_fragfrag_full)
+
+```
+### Now, we are going to prepare the full dataset, combining F-F and F-C comparisons, and assigning the value of 10K ha to continuous forest
+```{r}
+cf_area_ha <- 10000  # conventional area assigned to continuous forest
+
+meta_AB_All <- meta_AB %>%
+  mutate(
+    .orig_comp = Comparison,
+    
+    # CHANGED: standardise comparison labels only.
+    # No lnRR sign changes are made here.
+    Comparison = case_when(
+      .orig_comp %in% c("Frag_vs_Frag", "Frag_vs_Cont") ~ .orig_comp,
+      .orig_comp == "Cont_vs_Frag" ~ "Frag_vs_Cont",
+      TRUE ~ NA_character_
+    ),
+    
+    # Make area columns numeric
+    Fragment_size_ha = as.numeric(Fragment_size_ha),
+    Partner_Fragment_size_ha = as.numeric(Partner_Fragment_size_ha),
+    Cont_Fragment_size_ha = as.numeric(Cont_Fragment_size_ha)
+  ) %>%
+  
+  # Keep only recognised contrast types
+  filter(!is.na(Comparison)) %>%
+  
+  mutate(
+    forest_area_ref_ha = case_when(
+      Comparison == "Frag_vs_Frag" ~ pmax(Fragment_size_ha, Partner_Fragment_size_ha, na.rm = TRUE),
+      Comparison == "Frag_vs_Cont" ~ cf_area_ha,
+      TRUE ~ NA_real_
+    ),
+    
+    # Replace Inf/-Inf from pmax when both values are missing
+    forest_area_ref_ha = if_else(is.finite(forest_area_ref_ha), forest_area_ref_ha, NA_real_),
+    
+    # Log-transform and standardise for modelling
+    log_forest_area_ref   = log(forest_area_ref_ha),
+    log_forest_area_ref_s = as.numeric(scale(log_forest_area_ref))
+  ) %>%
+  
+  # Drop rows that still lack a usable forest-area moderator
+  filter(is.finite(log_forest_area_ref)) %>%
+  
+  # Remove helper column
+  select(-.orig_comp)
+
+  #scaling variables: 
+meta_AB_All <- meta_AB_All %>%
+  mutate(
+    # numeric transforms
+    Elevation_s   = as.numeric(scale(Elevation)),
+    Rainfall_mm_s = as.numeric(scale(Rainfall_mm)),
+    Latitude_s    = as.numeric(scale(Latitude)),
+    Longitude_s   = as.numeric(scale(Longitude))
+  )
+
+#model without interaction term
+meta_AB_all_full  <- readRDS("m_abundance_ALL_new.rds")
+summary(meta_AB_all_full)
+
+#model with interaction term (Comparison and the size of the reference forest area)
+m_int_AB_ALL  <- readRDS("m_abundance_interaction_ALL_new.rds")
+summary(m_int_AB_ALL)
+
+#loo test 
+loo_AB_no_interaction <- loo(meta_AB_all_full)
+loo_AB_interaction <- loo(m_int_AB_ALL)
+loo_compare(loo_AB_no_interaction, loo_AB_interaction)
+
+mcmc_intervals(as_draws_df(m_int_AB_ALL), pars = vars(starts_with("b_")),
+               prob = 0.95) +
+  vline_at(0, linetype = "dashed")
+
+#looking at the smallest fragment size as a moderator in the full dataset:
+
+meta_AB_All <- meta_AB_All %>%
+  mutate(
+    log_size_small = case_when(
+      Comparison == "Frag_vs_Frag" ~ log(pmin(Fragment_size_ha, Partner_Fragment_size_ha)),
+      Comparison == "Frag_vs_Cont" ~ log(Fragment_size_ha),
+      TRUE ~ NA_real_
+    ),
+    log_size_small_s = as.numeric(scale(log_size_small))
+  )
+
+m_int_AB_ALL_fragsize  <- readRDS("m_abundance_ALL_FragSize.rds")
+summary(m_int_AB_ALL_fragsize)
+
+```
