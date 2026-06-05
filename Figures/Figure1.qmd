@@ -1,0 +1,197 @@
+---
+title: "Figure 1"
+subtitle: "Creating a map to show the geographic distribution of studies included in the meta-analysis and the number of effect sizes in each study."
+author: "Dillan Hoyt"
+execute: 
+  eval: true
+  echo: false
+  message: false
+editor: visual
+toc: true
+toc-depth: 3
+toc-title: Contents
+---
+
+```{r}
+#Adding packages: 
+libs <- c(
+  "sf", "rnaturalearth", "rnaturalearthdata", "ggplot2", "ggrepel",
+  "dplyr", "countrycode", "scales"
+)   
+invisible(lapply(libs, library, character.only = TRUE))
+
+#adding information of each site and 
+meta_bats <- read.csv("Metadata_Figure1.csv")
+
+# load world
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+# canonicalise meta table
+meta_bats <- meta_bats %>%
+  mutate(
+    Country_raw = as.character(Country),
+    Country_std = countrycode(Country_raw, "country.name", "country.name", warn = FALSE)
+  ) %>%
+  # fallback manual recodes for common edge cases you already know
+  mutate(
+    Country_std = case_when(
+      Country_raw %in% c("U.S.A", "USA", "Usa", "United States Of America") ~ "United States",
+      Country_raw %in% c("French Guiana") ~ "France",
+      Country_raw %in% c("Borneo","Malaysia Borneo","Malysia Borneo","Borneo ") ~ "Malaysia",
+      TRUE ~ Country_std
+    )
+  )
+
+
+# build paper-level unique points (one point per Paper_ID)
+paper_points <- meta_bats %>%
+  distinct(Paper_ID, Country, Longitude, Latitude, n_total, .keep_all = TRUE) %>%
+  filter(!is.na(Longitude) & !is.na(Latitude)) %>%
+  # optional: if there are multiple rows per paper with different coords take the first
+  group_by(Paper_ID) %>%
+  slice_head(n = 1) %>%
+  ungroup()
+
+# convert to sf points (WGS84)
+paper_sf <- st_as_sf(paper_points, coords = c("Longitude", "Latitude"), crs = 4326, remove = FALSE)
+
+# world polygons
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+# spatially match each paper point to the world polygon it falls in
+paper_match <- st_join(paper_sf, world %>% select(name), left = TRUE, join = st_within) %>%
+  st_drop_geometry() %>%
+  rename(matched_country = name)
+
+# count unique papers per matched country 
+country_counts <- paper_match %>%
+  distinct(Paper_ID, matched_country) %>%
+  filter(!is.na(matched_country)) %>%
+  count(matched_country, name = "n_papers")
+
+# left-join counts onto world using the polygon name
+world_meta <- world %>%
+  left_join(country_counts, by = c("name" = "matched_country"))
+
+
+#French Guiana is currently appearing as France, so we need to derive a polygon for FG and assign it the correct count (2 papers).
+fg_bbox <- st_as_sfc(st_bbox(c(xmin = -55.0, xmax = -50.0, ymin = 2.0, ymax = 6.0), crs = st_crs(4326)))
+
+# get France polygon from the Natural Earth `world` sf
+fr_row <- world %>% filter(name == "France")
+if (nrow(fr_row) == 0) stop("No France polygon found in 'world' object.")
+
+# intersect France with bbox -> French Guiana polygon
+fg_poly <- st_intersection(fr_row, fg_bbox)
+if (nrow(fg_poly) == 0) {
+  # try slightly larger bbox if first intersection failed
+  fg_bbox2 <- st_as_sfc(st_bbox(c(xmin = -56, xmax = -49, ymin = 1.5, ymax = 7.0), crs = st_crs(4326)))
+  fg_poly <- st_intersection(fr_row, fg_bbox2)
+}
+
+# assign name + count (2 studies as you requested)
+fg_poly <- fg_poly %>% mutate(name = "French Guiana", n_papers = 2L)
+
+# prepare mainland France as unfilled (NA) to avoid colouring metropolitan France
+france_mainland <- fr_row %>% mutate(n_papers = NA_integer_)
+
+# build updated world_meta:
+# remove original France row from world_meta if present, then bind mainland France (NA) + FG polygon
+world_meta_no_fr <- world_meta %>% filter(name != "France")
+
+# ensure fg_poly has same columns as world_meta_no_fr (keep geometry + name + n_papers)
+fg_poly_to_bind <- fg_poly %>% select(all_of(intersect(names(world_meta_no_fr), names(fg_poly))))
+
+world_meta_updated <- bind_rows(
+  world_meta_no_fr,
+  # include mainland France geometry but with NA fill
+  france_mainland %>% select(names(world_meta_no_fr)),
+  # add French Guiana polygon (with n_papers = 2)
+  fg_poly_to_bind %>% mutate(!!!setNames(rep(list(NA), length(setdiff(names(world_meta_no_fr), names(fg_poly_to_bind)))), setdiff(names(world_meta_no_fr), names(fg_poly_to_bind))))
+)
+
+# plotting palette 
+cb_ramp <- c("#440154FF", "#365C8DFF", "#1FA187FF", "#9FDA3AFF", "#FDE725FF")
+
+max_val <- max(world_meta_updated$n_papers, na.rm = TRUE)
+
+# compute b_cnt
+b_cnt <- country_counts %>% filter(matched_country %in% c("Brazil","Brasil")) %>% summarise(n = sum(n_papers, na.rm=TRUE)) %>% pull(n)
+b_cnt <- ifelse(length(b_cnt)==0 || is.na(b_cnt), 0, b_cnt)
+
+# set Brazil n_papers in world_meta_updated
+world_meta_updated <- world_meta_updated %>%
+  mutate(n_papers = ifelse(name == "Brazil", as.integer(b_cnt), n_papers))
+
+# label centroids for countries with studies
+label_df <- world_meta_updated %>%
+  filter(!is.na(n_papers) & n_papers > 0) %>%
+  mutate(centroid = st_point_on_surface(geometry)) %>%
+  mutate(X = st_coordinates(centroid)[, 1],
+         Y = st_coordinates(centroid)[, 2]) %>%
+  st_drop_geometry()
+
+
+  
+# final plot: country fill + paper points sized by n_total 
+fig_map_meta <- ggplot() +
+  geom_sf(data = world_meta_updated, aes(fill = n_papers), colour = "white", linewidth = 0.25) +
+  geom_sf(
+    data = paper_sf,
+    aes(size = n_total),
+    shape = 21, fill = "black", alpha = 0.7, color = "white", stroke = 0.2
+  ) +
+  geom_label_repel(
+    data = label_df,
+    aes(x = X, y = Y, label = name),
+    size = 3,
+    box.padding = 0.4,
+    point.padding = 0.6,
+    segment.color = "grey40",
+    segment.size = 0,
+    fill = "white",
+    color = "black",
+    max.overlaps = 20,
+    force = 4
+  ) +
+  scale_fill_gradientn(
+    colours = cb_ramp,
+    limits = c(0, max_val),
+    oob = scales::squish,
+    trans = "sqrt",
+    na.value = "grey92",
+    name = "Countries (no. of studies)",
+    guide = guide_colorbar(
+      barwidth = unit(12, "cm"),
+      barheight = unit(0.6, "cm")
+    )
+  ) +
+  scale_size_continuous(
+    range = c(2, 8),
+    breaks = c(100, 1000, 2000, 3000),
+    labels = scales::comma,
+    name = "No. effect sizes per study"
+  ) +
+  coord_sf(expand = FALSE) +
+  labs(
+    title = "Global distribution of studies and sampling points",
+    subtitle = ""
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom",
+    legend.box = "vertical",
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank()
+  )
+
+# show plot
+print(fig_map_meta)
+
+ggsave("global_study_map_points.pdf", plot = fig_map_meta, width = 11, height = 7, units = "in", dpi = 300)
+
+
+
+```
