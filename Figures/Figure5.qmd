@@ -1,0 +1,167 @@
+---
+title: "Figure 5"
+subtitle: "Relationship between body mass and species-level responses to forest fragmentation. "
+author: "Dillan Hoyt"
+execute: 
+  eval: true
+  echo: false
+  message: false
+editor: visual
+toc: true
+toc-depth: 3
+toc-title: Contents
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(brms)
+library(tibble)
+library(viridis)
+
+meta_species_FC <- read.csv("meta_species_FC.csv")
+main_model <- readRDS("m_batTraits_species.student_CF.rds")
+df_obs <- main_model$data
+
+# body-mass scaling
+bm_mean <- mean(meta_species_FC$Averagemass_g, na.rm = TRUE)
+bm_sd   <- sd(meta_species_FC$Averagemass_g, na.rm = TRUE)
+
+df_obs <- df_obs %>%
+  mutate(Averagemass_g = Averagemass_g_s * bm_sd + bm_mean)
+
+# species-level estimates from model coefficients
+species_effects <- NULL
+
+coef_list <- tryCatch(coef(main_model), error = function(e) NULL)
+if (!is.null(coef_list) && "Species" %in% names(coef_list)) {
+  coefs_sp <- coef_list$Species
+  int_name <- intersect(dimnames(coefs_sp)[[2]], c("(Intercept)", "Intercept", "Intercept "))[1]
+
+  if (!is.na(int_name)) {
+    species_effects <- tibble(
+      Species = rownames(coefs_sp[, , 1]),
+      Estimate = coefs_sp[, int_name, "Estimate"]
+    )
+  }
+}
+
+if (is.null(species_effects)) {
+  post_ep <- posterior_epred(main_model, re_formula = NULL)
+  obs_species <- as.character(df_obs$Species)
+  species_list <- unique(obs_species)
+
+  species_effects <- tibble(
+    Species = species_list,
+    Estimate = vapply(species_list, function(sp) {
+      idx <- which(obs_species == sp)
+      if (length(idx) == 0) return(NA_real_)
+      mean(rowMeans(post_ep[, idx, drop = FALSE]))
+    }, numeric(1))
+  )
+}
+
+species_mass_model <- df_obs %>%
+  group_by(Species) %>%
+  summarise(
+    Averagemass_g = mean(Averagemass_g, na.rm = TRUE),
+    n_effects = n(),
+    .groups = "drop"
+  )
+
+species_effects <- species_effects %>%
+  left_join(species_mass_model, by = "Species") %>%
+  mutate(n_effects_cap = pmin(as.integer(n_effects), 150L))
+
+# prediction ribbon
+df_model <- main_model$data
+
+ref_aspect <- mean(df_model$Aspect_ratio_s, na.rm = TRUE)
+ref_vi     <- mean(df_model$vi, na.rm = TRUE)
+ref_se     <- mean(df_model$se_obs, na.rm = TRUE)
+
+mass_seq_s <- seq(
+  min(df_model$Averagemass_g_s, na.rm = TRUE),
+  max(df_model$Averagemass_g_s, na.rm = TRUE),
+  length.out = 80
+)
+
+newdata <- tibble(
+  Averagemass_g_s = mass_seq_s,
+  Aspect_ratio_s = ref_aspect,
+  vi = ref_vi,
+  se_obs = ref_se,
+  Conservation_status = factor(
+    levels(df_model$Conservation_status)[1],
+    levels = levels(df_model$Conservation_status)
+  ),
+  Habitat_affinity_new = factor(
+    levels(df_model$Habitat_affinity_new)[1],
+    levels = levels(df_model$Habitat_affinity_new)
+  ),
+  Diet = factor(
+    levels(df_model$Diet)[1],
+    levels = levels(df_model$Diet)
+  )
+)
+
+post_pred <- posterior_epred(main_model, newdata = newdata, re_formula = NA)
+
+pred_summ <- tibble(
+  Averagemass_g_s = mass_seq_s,
+  lnRR_mean = apply(post_pred, 2, mean),
+  lnRR_lo = apply(post_pred, 2, quantile, probs = 0.025),
+  lnRR_hi = apply(post_pred, 2, quantile, probs = 0.975)
+) %>%
+  mutate(Averagemass_g = Averagemass_g_s * bm_sd + bm_mean)
+
+# plot
+p_pub_fixed <- ggplot() +
+  geom_jitter(
+    data = df_obs,
+    aes(x = Averagemass_g, y = lnRR),
+    width = 0, height = 0.12,
+    size = 1, alpha = 0.15, colour = "grey55"
+  ) +
+  geom_ribbon(
+    data = pred_summ,
+    aes(x = Averagemass_g, ymin = lnRR_lo, ymax = lnRR_hi),
+    fill = "lightgrey", alpha = 0.36
+  ) +
+  geom_line(
+    data = pred_summ,
+    aes(x = Averagemass_g, y = lnRR_mean),
+    linewidth = 1.1
+  ) +
+  geom_point(
+    data = species_effects,
+    aes(x = Averagemass_g, y = Estimate, fill = n_effects_cap),
+    shape = 21, colour = "grey30", stroke = 0.45, size = 3.4, alpha = 0.95
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_fill_viridis_c(name = "No. of effect sizes", option = "viridis") +
+  labs(
+    x = "Body mass (g)",
+    y = "lnRR (log response ratio)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = c(0.85, 0.9),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9)
+  )
+
+print(p_pub_fixed)
+
+ggsave(
+  "Fig_5bodymass.tiff",
+  p_pub_fixed,
+  width = 170,
+  height = 120,
+  units = "mm",
+  dpi = 600,
+  device = "tiff",
+  compression = "lzw"
+)
+```
