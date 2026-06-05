@@ -1,0 +1,246 @@
+---
+title: "Figure 6: Trait-mediated responses of bat species to forest fragmentation.   "
+subtitle: "Posterior estimates of species-level effect sizes (lnRR) for morphological, ecological, and conservation-related traits under two fragmentation comparisons: fragment vs continuous forest (left panel) and between-fragment comparison (right panel). "
+Author: "Dillan Hoyt"
+execute: 
+  eval: true
+  echo: false
+  message: false
+editor: visual
+toc: true
+toc-depth: 3
+toc-title: Contents
+---
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(posterior)
+library(viridis)
+library(scales)
+library(stringr)
+library(brms)
+library(rstan)
+library(grid)
+
+
+#Input models
+fit_fc <- readRDS("m_batTraits_species.student_CF.rds")
+fit_ff <- readRDS("m_batTraits_species.student_FF_new.rds")
+
+# ------------------------------------------------------------------
+# 2. Shared fixed effects
+# ------------------------------------------------------------------
+common_terms <- setdiff(
+  intersect(rownames(fixef(fit_fc)), rownames(fixef(fit_ff))),
+  c("(Intercept)", "Intercept")
+)
+
+# ------------------------------------------------------------------
+# 3. Extract fixed-effect summaries + sampled posterior draws
+# ------------------------------------------------------------------
+extract_effects <- function(mod, response_label, terms, n_draws = 400) {
+  fe <- as.data.frame(fixef(mod)) %>%
+    rownames_to_column("term") %>%
+    filter(term %in% terms) %>%
+    mutate(
+      signif = ifelse(Q2.5 > 0 | Q97.5 < 0, "yes", "no"),
+      sign = case_when(
+        Estimate > 0 & signif == "yes" ~ "positive",
+        Estimate < 0 & signif == "yes" ~ "negative",
+        TRUE ~ "non-significant"
+      ),
+      response = response_label
+    )
+
+  draws <- as_draws_df(mod) %>%
+    as.data.frame() %>%
+    select(all_of(paste0("b_", terms))) %>%
+    setNames(sub("^b_", "", names(.))) %>%
+    as_tibble() %>%
+    pivot_longer(cols = everything(), names_to = "term", values_to = "value") %>%
+    group_by(term) %>%
+    group_modify(~ slice_sample(.x, n = min(nrow(.x), n_draws))) %>%
+    ungroup() %>%
+    mutate(response = response_label)
+
+  list(summary = fe, draws = draws)
+}
+
+res_fc <- extract_effects(fit_fc, "Frag–Cont", common_terms)
+res_ff <- extract_effects(fit_ff, "Frag–Frag", common_terms)
+
+summaries <- bind_rows(res_fc$summary, res_ff$summary)
+draws_all <- bind_rows(res_fc$draws, res_ff$draws)
+```
+
+# Labelling and aesthetics
+
+```{r}
+pretty_defs <- c(
+  Averagemass_g_s = "Average mass (g) 1683 (6529)",
+
+  Conservation_statusNT = "Conservation: Near threatened 36 (478)",
+  Conservation_statusDD = "Conservation: Data deficient 68 (379)",
+
+  DietFrugivore   = "Diet: Frugivore 529 (1304)",
+  DietInsectivore = "Diet: Insectivore 817 (4698)",
+  DietNectarivore = "Diet: Nectarivore 94 (171)",
+  DietCarnivore   = "Diet: Carnivore 103 (42)",
+  DietOmnivore    = "Diet: Omnivore 82 (77)",
+  DietPiscivore   = "Diet: Piscivore 16 (160)",
+  DietSanguivore  = "Diet: Sanguivore 42 (77)",
+
+  Habitat_affinity_newClutterMadapted =
+    "Habitat affinity: Clutter-adapted 1143 (2439)",
+  Habitat_affinity_newBackgroundMclutterMadapted =
+    "Habitat affinity: Background clutter-adapted 489 (2570)",
+  Habitat_affinity_newEdgeMadapted =
+    "Habitat affinity: Edge-adapted 28 (321)",
+  Habitat_affinity_newOpenMadapted =
+    "Habitat affinity: Open-adapted 7 (1033)",
+  Habitat_affinity_newWaterMadapted =
+    "Habitat affinity: Water-adapted 16 (166)"
+)
+
+fallback_label <- function(x) {
+  x %>%
+    str_replace_all("_", " ") %>%
+    str_replace_all("([a-z])([A-Z])", "\\1 \\2") %>%
+    str_squish()
+}
+
+label_lookup <- setNames(
+  ifelse(
+    common_terms %in% names(pretty_defs),
+    pretty_defs[common_terms],
+    fallback_label(common_terms)
+  ),
+  common_terms
+)
+
+summaries <- summaries %>%
+  mutate(term_label = label_lookup[term])
+
+draws_all <- draws_all %>%
+  mutate(term_label = label_lookup[term])
+```
+
+# Preparing plot data:
+
+```{r}
+summaries_plot <- summaries %>%
+  mutate(fill_val = sign(Estimate) * abs(Estimate)^0.35)
+
+draws_all_plot <- draws_all %>%
+  mutate(fill_val = sign(value) * abs(value)^0.35)
+
+levels_plot <- rev(unique(summaries_plot$term_label))
+
+summaries_plot <- summaries_plot %>%
+  mutate(term_label = factor(term_label, levels = levels_plot))
+
+draws_all_plot <- draws_all_plot %>%
+  mutate(term_label = factor(term_label, levels = levels_plot))
+
+row_df_plot <- tibble(
+  term_label = factor(levels_plot, levels = levels_plot),
+  y = seq_along(levels_plot)
+)
+```
+
+# Palette and title:
+
+```{r}
+response_labels <- c(
+  "Frag–Cont" = "Continuous forest vs fragment\n(123 species; 1683 observations)",
+  "Frag–Frag" = "Fragment vs fragment\n(143 species; 6529 observations)"
+)
+
+cb_ramp <- c(
+  "#440154FF", "#46337EFF", "#365C8DFF", "#277F8EFF",
+  "#1FA187FF", "#4AC16DFF", "#9FDA3AFF", "#FDE725FF"
+)
+
+lim <- quantile(abs(draws_all_plot$value), 0.90, na.rm = TRUE)
+fill_limits <- c(-lim, lim)
+```
+
+# Plotting:
+
+```{r}
+
+p_traits <- ggplot() +
+  geom_rect(
+    data = row_df_plot[row_df_plot$y %% 2 == 0, ],
+    aes(ymin = y - 0.5, ymax = y + 0.5),
+    xmin = -Inf, xmax = Inf,
+    fill = "grey97", colour = NA, inherit.aes = FALSE
+  ) +
+  geom_rect(
+    data = row_df_plot[row_df_plot$y %% 2 == 1, ],
+    aes(ymin = y - 0.5, ymax = y + 0.5),
+    xmin = -Inf, xmax = Inf,
+    fill = "white", colour = NA, inherit.aes = FALSE
+  ) +
+  geom_jitter(
+    data = draws_all_plot,
+    aes(x = value, y = term_label, fill = fill_val),
+    shape = 21, height = 0.12, width = 0,
+    alpha = 0.10, size = 0.6, colour = "grey55"
+  ) +
+  geom_errorbarh(
+    data = summaries_plot,
+    aes(y = term_label, xmin = Q2.5, xmax = Q97.5),
+    height = 0.25, linewidth = 0.9, colour = "black"
+  ) +
+  geom_point(
+    data = summaries_plot,
+    aes(x = Estimate, y = term_label, fill = fill_val),
+    shape = 21, size = 4, colour = "black", stroke = 0.35
+  ) +
+  scale_fill_gradientn(
+    colours = cb_ramp,
+    limits = fill_limits,
+    oob = scales::squish,
+    values = scales::rescale(c(fill_limits[1], 0, fill_limits[2])),
+    guide = guide_colorbar(
+      title = "Effect size",
+      barwidth = unit(8, "cm"),
+      barheight = unit(0.4, "cm")
+    )
+  ) +
+  facet_wrap(~response, ncol = 2, scales = "free_x",
+             labeller = labeller(response = response_labels)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  coord_cartesian(clip = "off") +
+  labs(x = "Effect size (lnRR)", y = NULL, fill = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_line(colour = "gray92", linewidth = 0.25),
+    panel.grid.minor.y = element_blank(),
+    strip.text = element_text(size = 13, face = "bold", lineheight = 0.9),
+    strip.background = element_rect(fill = "white", colour = NA),
+    strip.placement = "outside",
+    axis.title.y = element_blank(),
+    plot.margin = margin(t = 20, r = 8, b = 8, l = 8),
+    legend.position = "bottom"
+  )
+
+p_traits
+
+ggsave(
+  filename = "Fig_traits_fragmentation_pub_new.tiff",
+  plot = p_traits,
+  device = "tiff",
+  width = 25,
+  height = 22,
+  units = "cm",
+  dpi = 600,
+  compression = "lzw"
+)
+```
