@@ -1,0 +1,349 @@
+---
+title: "Figure 3"
+subtitle: "Posterior estimates of fixed effects from the global meta‐analysis models for species richness (left) and total abundance (right).  "
+author: "Dillan Hoyt"
+execute: 
+  eval: true
+  echo: false
+  message: false
+editor: visual
+toc: true
+toc-depth: 3
+toc-title: Contents
+---
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(brms)
+library(posterior)
+library(tibble)
+library(scales)
+library(grid)
+
+set.seed(2025)
+
+# Load models 
+sr_mod <- readRDS("m_sr_all_randomeffect_andinteraction_new.rds")
+ab_mod <- readRDS("m_abundance_interaction_ALL_new.rds")
+
+sr_data <- sr_mod$data
+ab_data <- ab_mod$data
+
+```
+
+```{r}
+
+# standardise matrix labels for counting
+standardise_matrix_names <- function(df) {
+  if (!"Matrix_mean" %in% names(df)) return(df)
+  m <- as.character(df$Matrix_mean)
+  m <- trimws(m)
+  m_lower <- tolower(m)
+  
+  m[m_lower %in% c("open land", "openland", "open_land", "open-land", "open", "savanna", "savannah")] <- "Savanna"
+  m[m_lower %in% c("production forest", "production_forests", "productionforests")] <- "Production forest"
+  m[grepl("^secondary", m_lower)] <- "Secondary forest"
+  m[grepl("water", m_lower)] <- "Water"
+  m[grepl("human", m_lower)] <- "Human Settlements"
+  m[grepl("agric", m_lower)] <- "Agriculture"
+  
+  df$Matrix_mean <- factor(m)
+  df
+}
+
+sr_data <- standardise_matrix_names(sr_data)
+ab_data <- standardise_matrix_names(ab_data)
+
+# Order the variables in the same way for both datasets
+term_labels <- c(
+  "ComparisonFrag_vs_Cont"        = "F-C (fragment vs continuous)",
+  "ComparisonFrag_vs_Frag"        = "F-F (fragment vs fragment)",
+  "log_forest_area_ref_s"         = "Reference forest area",
+  "Elevation_s"                   = "Elevation (m)",
+  "Rainfall_mm_s"                 = "Rainfall (mm)",
+  "Latitude_s"                    = "Latitude",
+  "Longitude_s"                   = "Longitude",
+  "Matrix_meanOpen_land"          = "Matrix: Savanna",
+  "Matrix_meanProduction_forests" = "Matrix: Production forest",
+  "Matrix_meanSecondaryforest"    = "Matrix: Secondary forest",
+  "Matrix_meanWater"              = "Matrix: Water",
+  "Forest_GroupTropical_Lowland"  = "Forest: Tropical lowland",
+  "Forest_GroupTropical_Montane"  = "Forest: Tropical montane",
+  "Forest_GroupTemperate"         = "Forest: Temperate"
+)
+
+term_order <- c(
+  "ComparisonFrag_vs_Cont",
+  "ComparisonFrag_vs_Frag",
+  "log_forest_area_ref_s",
+  "Elevation_s",
+  "Rainfall_mm_s",
+  "Latitude_s",
+  "Longitude_s",
+  "Matrix_meanOpen_land",
+  "Matrix_meanProduction_forests",
+  "Matrix_meanSecondaryforest",
+  "Matrix_meanWater",
+  "Forest_GroupTropical_Lowland",
+  "Forest_GroupTropical_Montane",
+  "Forest_GroupTemperate"
+)
+
+# mapping them just to make sure they're correctly ordered and labelled in the figure
+term_aliases <- list(
+  ComparisonFrag_vs_Cont        = c("ComparisonFrag_vs_Cont"),
+  ComparisonFrag_vs_Frag        = c("ComparisonFrag_vs_Frag"),
+  log_forest_area_ref_s         = c("log_forest_area_ref_s", "log_area_num_s"),
+  Elevation_s                   = c("Elevation_s"),
+  Rainfall_mm_s                 = c("Rainfall_mm_s"),
+  Latitude_s                    = c("Latitude_s"),
+  Longitude_s                   = c("Longitude_s"),
+  Matrix_meanOpen_land          = c("Matrix_meanOpen_land", "Matrix_meanOpenland", "Matrix_meanSavanna"),
+  Matrix_meanProduction_forests = c("Matrix_meanProduction_forests", "Matrix_meanProductionforests"),
+  Matrix_meanSecondaryforest    = c("Matrix_meanSecondaryforest"),
+  Matrix_meanWater              = c("Matrix_meanWater"),
+  Forest_GroupTropical_Lowland  = c("Forest_GroupTropical_Lowland", "Forest_GroupTropicalLowland"),
+  Forest_GroupTropical_Montane  = c("Forest_GroupTropical_Montane", "Forest_GroupTropicalMontane"),
+  Forest_GroupTemperate         = c("Forest_GroupTemperate")
+)
+
+# Counts for labels
+count_term <- function(df, term) {
+  if (!("Comparison" %in% names(df))) {
+    comp_n <- NA_integer_
+  } else {
+    comp_n <- NULL
+  }
+  
+  switch(
+    term,
+    ComparisonFrag_vs_Cont = if ("Comparison" %in% names(df)) sum(as.character(df$Comparison) == "Frag_vs_Cont", na.rm = TRUE) else NA_integer_,
+    ComparisonFrag_vs_Frag = if ("Comparison" %in% names(df)) sum(as.character(df$Comparison) == "Frag_vs_Frag", na.rm = TRUE) else NA_integer_,
+    
+    log_forest_area_ref_s  = sum(!is.na(df$log_forest_area_ref_s)),
+    Elevation_s            = sum(!is.na(df$Elevation_s)),
+    Rainfall_mm_s          = sum(!is.na(df$Rainfall_mm_s)),
+    Latitude_s             = sum(!is.na(df$Latitude_s)),
+    Longitude_s            = sum(!is.na(df$Longitude_s)),
+    
+    Matrix_meanOpen_land          = if ("Matrix_mean" %in% names(df)) sum(as.character(df$Matrix_mean) == "Savanna", na.rm = TRUE) else NA_integer_,
+    Matrix_meanProduction_forests = if ("Matrix_mean" %in% names(df)) sum(as.character(df$Matrix_mean) == "Production forest", na.rm = TRUE) else NA_integer_,
+    Matrix_meanSecondaryforest    = if ("Matrix_mean" %in% names(df)) sum(as.character(df$Matrix_mean) == "Secondary forest", na.rm = TRUE) else NA_integer_,
+    Matrix_meanWater              = if ("Matrix_mean" %in% names(df)) sum(as.character(df$Matrix_mean) == "Water", na.rm = TRUE) else NA_integer_,
+    
+    Forest_GroupTropical_Lowland  = if ("Forest_Group" %in% names(df)) sum(as.character(df$Forest_Group) == "Tropical_Lowland", na.rm = TRUE) else NA_integer_,
+    Forest_GroupTropical_Montane  = if ("Forest_Group" %in% names(df)) sum(as.character(df$Forest_Group) == "Tropical_Montane", na.rm = TRUE) else NA_integer_,
+    Forest_GroupTemperate         = if ("Forest_Group" %in% names(df)) sum(as.character(df$Forest_Group) == "Temperate", na.rm = TRUE) else NA_integer_,
+    
+    NA_integer_
+  )
+}
+
+fmt_n <- function(x) {
+  if (is.na(x) || x <= 0) "-" else formatC(x, format = "d", big.mark = ",")
+}
+
+make_label <- function(term) {
+  sr_n <- count_term(sr_data, term)
+  ab_n <- count_term(ab_data, term)
+  
+  base <- if (term %in% names(term_labels)) term_labels[[term]] else term
+  paste0(base, " ", fmt_n(sr_n), " (", fmt_n(ab_n), ")")
+}
+
+label_lookup <- setNames(vapply(term_order, make_label, character(1)), term_order)
+
+# Extract fixed effects and create comparison rows
+
+extract_plot_data <- function(mod, response_label, term_order, term_aliases, label_lookup) {
+  draws_df <- posterior::as_draws_df(posterior::as_draws_array(mod))
+  
+  # Fixed-effect draw columns
+  b_cols <- grep("^b_", names(draws_df), value = TRUE)
+  b_names <- sub("^b_", "", b_cols)
+  b_map <- setNames(b_cols, b_names)
+  
+  # Intercept draws
+  if (!("b_Intercept" %in% names(draws_df))) {
+    stop("Model is missing b_Intercept draws.")
+  }
+  intercept_draws <- as.numeric(draws_df[["b_Intercept"]])
+  
+  out_summary <- list()
+  out_draws <- list()
+  
+  for (term in term_order) {
+    aliases <- term_aliases[[term]]
+    available_alias <- aliases[aliases %in% names(b_map)]
+    
+    if (term == "ComparisonFrag_vs_Cont") {
+      # Reference comparison level: use intercept
+      vals <- intercept_draws
+      
+    } else if (term == "ComparisonFrag_vs_Frag") {
+      # Non-reference comparison level: intercept + coefficient
+      if (!("ComparisonFrag_vs_Frag" %in% names(b_map))) next
+      vals <- intercept_draws + as.numeric(draws_df[[b_map[["ComparisonFrag_vs_Frag"]]]])
+      
+    } else {
+      # Standard coefficient term
+      if (length(available_alias) == 0) next
+      vals <- as.numeric(draws_df[[b_map[[available_alias[1]]]]])
+    }
+    
+    out_summary[[term]] <- data.frame(
+      term = term,
+      Estimate = mean(vals, na.rm = TRUE),
+      CI_low = as.numeric(quantile(vals, 0.025, na.rm = TRUE)),
+      CI_high = as.numeric(quantile(vals, 0.975, na.rm = TRUE)),
+      response = response_label,
+      label = label_lookup[[term]],
+      stringsAsFactors = FALSE
+    )
+    
+    n_keep <- min(length(vals), 500)
+    idx <- sample(seq_along(vals), size = n_keep, replace = FALSE)
+    out_draws[[term]] <- data.frame(
+      term = term,
+      value = vals[idx],
+      response = response_label,
+      label = label_lookup[[term]],
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  list(
+    summary = bind_rows(out_summary),
+    draws = bind_rows(out_draws)
+  )
+}
+
+sr_res <- extract_plot_data(sr_mod, "Species richness", term_order, term_aliases, label_lookup)
+ab_res <- extract_plot_data(ab_mod, "Total abundance", term_order, term_aliases, label_lookup)
+
+summaries <- bind_rows(sr_res$summary, ab_res$summary)
+draws_all <- bind_rows(sr_res$draws, ab_res$draws)
+
+# Clean order terms 
+keep_terms <- term_order
+
+summaries <- summaries %>%
+  filter(term %in% keep_terms) %>%
+  mutate(
+    label = label_lookup[term],
+    fill_val = sign(Estimate) * abs(Estimate)^0.35
+  )
+
+draws_all <- draws_all %>%
+  filter(term %in% keep_terms) %>%
+  mutate(
+    label = label_lookup[term],
+    fill_val = sign(value) * abs(value)^0.35
+  )
+
+# Remove terms not wanted in figure
+drop_terms <- c("Forest_GroupEucalyptus", "Matrix_meanHuman_settlements")
+summaries <- summaries %>% filter(!term %in% drop_terms)
+draws_all  <- draws_all %>% filter(!term %in% drop_terms)
+
+# Keep only labels still present
+label_levels <- label_lookup[keep_terms[keep_terms %in% summaries$term]]
+label_levels <- label_levels[!is.na(label_levels)]
+label_levels <- rev(unique(label_levels))
+
+summaries$label <- factor(summaries$label, levels = label_levels)
+draws_all$label  <- factor(draws_all$label, levels = label_levels)
+
+# Background stripes
+row_df_plot <- data.frame(
+  label = levels(summaries$label),
+  y = seq_along(levels(summaries$label)),
+  stringsAsFactors = FALSE
+)
+
+# Plot
+cb_ramp <- c(
+  "#440154FF", "#46337EFF", "#365C8DFF", "#277F8EFF",
+  "#1FA187FF", "#4AC16DFF", "#9FDA3AFF", "#FDE725FF"
+)
+
+fill_limits <- range(c(summaries$fill_val, draws_all$fill_val), na.rm = TRUE)
+
+p_final <- ggplot() +
+  geom_rect(
+    data = row_df_plot[row_df_plot$y %% 2 == 0, ],
+    aes(ymin = y - 0.5, ymax = y + 0.5),
+    xmin = -Inf, xmax = Inf,
+    fill = "grey97", color = NA,
+    inherit.aes = FALSE
+  ) +
+  geom_rect(
+    data = row_df_plot[row_df_plot$y %% 2 == 1, ],
+    aes(ymin = y - 0.5, ymax = y + 0.5),
+    xmin = -Inf, xmax = Inf,
+    fill = "white", color = NA,
+    inherit.aes = FALSE
+  ) +
+  geom_jitter(
+    data = draws_all,
+    aes(x = value, y = label, fill = fill_val),
+    shape = 21, height = 0.12, width = 0,
+    alpha = 0.10, size = 0.6, color = "grey55"
+  ) +
+  geom_errorbar(
+    data = summaries,
+    aes(xmin = CI_low, xmax = CI_high, y = label),
+    orientation = "y",
+    linewidth = 0.9,
+    color = "black",
+    width = 0.25
+  ) +
+  geom_point(
+    data = summaries,
+    aes(x = Estimate, y = label, fill = fill_val),
+    shape = 21, size = 3.2, color = "black", stroke = 0.35
+  ) +
+  scale_fill_gradientn(
+    colours = cb_ramp,
+    limits = fill_limits,
+    oob = scales::squish,
+    values = scales::rescale(c(fill_limits[1], 0, fill_limits[2])),
+    guide = guide_colorbar(
+      title = "Effect size",
+      barwidth = unit(8, "cm"),
+      barheight = unit(0.4, "cm")
+    )
+  ) +
+  facet_wrap(~ response, ncol = 2, scales = "free_x") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  coord_cartesian(clip = "off") +
+  labs(x = "Effect size (lnRR)", y = NULL, fill = "") +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    panel.grid.major.y = element_line(color = "gray92", linewidth = 0.25),
+    strip.text = element_text(size = 18, face = "bold", hjust = 0.5),
+    strip.background = element_rect(fill = "white", color = NA),
+    strip.placement = "outside",
+    axis.title.y = element_blank(),
+    plot.margin = margin(t = 20, r = 8, b = 8, l = 8),
+    legend.position = "bottom"
+  )
+
+print(p_final)
+
+ggsave(
+  "Fig_SRandAbunLandcape_fina_NEW.tiff",
+  plot = p_final,
+  width = 178,
+  height = 200,
+  units = "mm",
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
+```
