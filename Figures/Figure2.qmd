@@ -1,0 +1,231 @@
+---
+title: "Figure 2"
+subtitle: "Posterior estimates of (A) mean log response ratios (lnRR) for species richness and (B) species-level heterogeneity (σ_species) for fragment–continuous forest (F-C) and fragment–fragment (F-F) comparisons. "
+author: "Dillan Hoyt"
+execute: 
+  eval: true
+  echo: false
+  message: false
+editor: visual
+toc: true
+toc-depth: 3
+toc-title: Contents
+---
+```{r}
+library(brms)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(ggdist)
+library(patchwork)
+
+meta_SR_All <- read.csv("meta_SR_All.csv")
+model_sr_all_full <- readRDS("m_sr_all_new.rds")
+
+comp_levels <- c("Frag_vs_Cont", "Frag_vs_Frag")
+comp_labels <- c(
+  "Frag_vs_Cont" = "Fragment vs. continuous forest",
+  "Frag_vs_Frag" = "Fragment vs. fragment"
+)
+
+my_cols_strong <- c(
+  "Frag_vs_Cont" = "#238b45",
+  "Frag_vs_Frag" = "#2171b5"
+)
+
+median_vi_val <- median(meta_SR_All$vi, na.rm = TRUE)
+if (!is.finite(median_vi_val)) median_vi_val <- 0.2
+
+matrix_ref <- "Agriculture"
+forest_ref <- "Temperate"
+
+newdata_A <- tibble(
+  Comparison = factor(comp_levels, levels = comp_levels),
+  log_forest_area_ref_s = 0,
+  Elevation_s = 0,
+  Rainfall_mm_s = 0,
+  Latitude_s = 0,
+  Longitude_s = 0,
+  Matrix_mean = factor(matrix_ref, levels = levels(model_sr_all_full$data$Matrix_mean)),
+  Forest_Group = factor(forest_ref, levels = levels(model_sr_all_full$data$Forest_Group)),
+  vi = median_vi_val,
+  se_obs = sqrt(median_vi_val)
+)
+
+post_draws <- fitted(
+  model_sr_all_full,
+  newdata = newdata_A,
+  re_formula = NA,
+  summary = FALSE
+)
+
+post_df <- as_tibble(post_draws)
+colnames(post_df) <- as.character(newdata_A$Comparison)
+
+draws_long <- post_df %>%
+  pivot_longer(cols = everything(), names_to = "Comparison", values_to = "lnRR") %>%
+  mutate(Comparison = factor(Comparison, levels = comp_levels))
+
+sd_summary_95 <- draws_long %>%
+  group_by(Comparison) %>%
+  summarise(
+    median = median(lnRR, na.rm = TRUE),
+    lower95 = quantile(lnRR, 0.025, na.rm = TRUE),
+    upper95 = quantile(lnRR, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+sd_summary_66 <- draws_long %>%
+  group_by(Comparison) %>%
+  summarise(
+    lower66 = quantile(lnRR, 0.17, na.rm = TRUE),
+    upper66 = quantile(lnRR, 0.83, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+summ_df <- sd_summary_95 %>%
+  left_join(sd_summary_66, by = "Comparison")
+
+p_a <- ggplot(summ_df, aes(y = Comparison)) +
+  geom_segment(
+    aes(x = lower95, xend = upper95, yend = Comparison, color = Comparison),
+    linewidth = 1.0
+  ) +
+  geom_segment(
+    aes(x = lower66, xend = upper66, yend = Comparison, color = Comparison),
+    linewidth = 2.8
+  ) +
+  geom_point(
+    aes(x = median, color = Comparison),
+    size = 6
+  ) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    color = "grey40",
+    linewidth = 0.8
+  ) +
+  scale_color_manual(values = my_cols_strong, guide = "none") +
+  scale_y_discrete(
+    limits = rev(comp_levels),
+    labels = comp_labels,
+    expand = expansion(mult = c(0.3, 0.3))
+  ) +
+  labs(
+    title = "A. Estimated mean lnRR by comparison type",
+    x = "Estimated mean lnRR (population level)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major = element_line(color = "grey85"),
+    panel.grid.minor = element_line(color = "grey92"),
+    plot.title = element_text(face = "bold")
+  )
+
+print(p_a)
+
+# Figure 2B: Posterior distributions of species-level SD
+
+fit_b <- readRDS("m_batTraits_species.uncorr1_student.rds")
+draws_b <- posterior::as_draws_df(fit_b)
+
+candidate_sd_names <- grep(
+  "^sd[_\\.].*Species|sd\\(Species",
+  names(draws_b),
+  value = TRUE,
+  ignore.case = TRUE
+)
+
+sd_intercept_col <- candidate_sd_names[grepl("Intercept", candidate_sd_names, ignore.case = TRUE)][1]
+sd_slope_col     <- candidate_sd_names[grepl("Comparison", candidate_sd_names, ignore.case = TRUE)][1]
+
+
+sd_all <- tibble(
+  sd_species = c(
+    as.numeric(draws_b[[sd_intercept_col]]),
+    as.numeric(draws_b[[sd_slope_col]])
+  ),
+  contrast = factor(
+    rep(
+      c("Fragment vs Continuous", "Fragment vs Fragment"),
+      each = nrow(draws_b)
+    ),
+    levels = c("Fragment vs Continuous", "Fragment vs Fragment")
+  )
+)
+
+sd_summary_b <- sd_all %>%
+  group_by(contrast) %>%
+  summarise(
+    median = median(sd_species, na.rm = TRUE),
+    lower = quantile(sd_species, 0.025, na.rm = TRUE),
+    upper = quantile(sd_species, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+pal_fill_b <- c("Fragment vs Continuous" = "#74c69d", "Fragment vs Fragment" = "#74a9cf")
+pal_color_b <- c("Fragment vs Continuous" = "#238b45", "Fragment vs Fragment" = "#225ea8")
+
+xmax <- max(sd_all$sd_species, na.rm = TRUE) * 1.15
+
+p_b <- ggplot() +
+  stat_halfeye(
+    data = sd_all,
+    aes(x = sd_species, y = 0, fill = contrast),
+    .width = c(0.66, 0.95),
+    height = 0.58,
+    alpha = 0.7,
+    adjust = 0.7,
+    slab_alpha = 0.75,
+    inherit.aes = FALSE
+  ) +
+  geom_errorbarh(
+    data = sd_summary_b,
+    aes(xmin = lower, xmax = upper, y = 0, color = contrast),
+    height = 0.01,
+    linewidth = 0.9,
+    inherit.aes = FALSE
+  ) +
+  geom_point(
+    data = sd_summary_b,
+    aes(x = median, y = 0, color = contrast),
+    size = 3,
+    inherit.aes = FALSE
+  ) +
+  scale_fill_manual(values = pal_fill_b, name = NULL) +
+  scale_color_manual(values = pal_color_b, guide = "none") +
+  labs(
+    title = "B. Posterior distributions of species-level SD",
+    x = expression(sigma[species]),
+    y = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold"),
+    axis.title.x = element_text(size = 20),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  ) +
+  coord_cartesian(xlim = c(0, xmax), ylim = c(0, 0.55))
+
+p_b
+# ------------------------------------------------------------------------------
+# Combine and save
+# ------------------------------------------------------------------------------
+p_final <- p_a + p_b + plot_layout(ncol = 2, widths = c(0.5, 0.5))
+print(p_final)
+
+ggsave(
+  filename = "Fig2_ab_reviewers.tiff",
+  plot = p_final,
+  device = "tiff",
+  dpi = 600,
+  width = 14,
+  height = 5,
+  units = "in",
+  compression = "lzw"
+)
+```
