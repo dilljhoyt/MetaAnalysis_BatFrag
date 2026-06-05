@@ -1,0 +1,594 @@
+---
+title: "Figure 4"
+subtitle: "Creating Figure 4: Phylogenetically ordered estimates of species-level responses to forest fragmentation, expressed as predicted log response ratios (lnRR) of abundance in forest fragments relative to continuous forest. "
+Author: "Dillan Hoyt"
+execute: 
+  eval: true
+  echo: false
+  message: false
+editor: visual
+toc: true
+toc-depth: 3
+toc-title: Contents
+---
+# Build species-level predictions
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(posterior)
+library(viridis)
+library(scales)
+library(stringr)
+library(brms)
+library(rotl)
+library(ape)
+library(purrr)
+library(cowplot)
+library(ragg)
+library(grid)
+library(ggtree)
+
+# Insert model and csv
+meta_species_FC <- read.csv("meta_species_FC.csv")
+main_model <- readRDS("m_batTraits_species.student_CF.rds")
+moddata <- main_model$data
+
+
+# Build one representative row per species
+species_newdata <- meta_species_FC %>%
+  mutate(Species_model = as.character(Species_phylo_use)) %>%
+  filter(!is.na(Species_model)) %>%
+  group_by(Species_model) %>%
+  summarise(
+    n_obs = n(),
+    raw_mean_lnRR = mean(lnRR, na.rm = TRUE),
+    Averagemass_g_s = first(Averagemass_g_s[!is.na(Averagemass_g_s)]),
+    Aspect_ratio_s = first(Aspect_ratio_s[!is.na(Aspect_ratio_s)]),
+    Conservation_status = first(Conservation_status[!is.na(Conservation_status)]),
+    Habitat_affinity_new = first(Habitat_affinity_new[!is.na(Habitat_affinity_new)]),
+    Diet = first(Diet[!is.na(Diet)]),
+    Paper_ID = first(as.character(Paper_ID[!is.na(Paper_ID)])),
+    se_obs = mean(se_obs, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(
+    Species_model %in% levels(moddata$Species),
+    n_obs >= 5
+  )
+
+global_se_obs_mean <- mean(meta_species_FC$se_obs, na.rm = TRUE)
+species_newdata <- species_newdata %>%
+  mutate(se_obs = ifelse(is.na(se_obs), global_se_obs_mean, se_obs))
+
+species_newdata <- species_newdata %>%
+  mutate(
+    se_obs = ifelse(is.na(se_obs), global_se_obs_mean, se_obs),
+    Species = factor(Species_model, levels = levels(moddata$Species)),
+    Paper_ID = factor(Paper_ID, levels = levels(moddata$Paper_ID)),
+    Conservation_status = factor(Conservation_status, levels = levels(moddata$Conservation_status)),
+    Habitat_affinity_new = factor(Habitat_affinity_new, levels = levels(moddata$Habitat_affinity_new)),
+    Diet = factor(Diet, levels = levels(moddata$Diet))
+  )
+```
+# Species-only predictions
+
+```{r}
+
+species_newdata_forpred <- species_newdata %>%
+  mutate(Paper_ID = NA)
+
+pred_species_only <- fitted(
+  main_model,
+  newdata = species_newdata_forpred,
+  re_formula = ~ (1 | gr(Species, cov = phylo_cor)),
+  summary = TRUE,
+  probs = c(0.025, 0.975),
+  allow_new_levels = TRUE
+)
+
+species_preds <- species_newdata_forpred %>%
+  mutate(
+    Estimate = pred_species_only[, "Estimate"],
+    Q2.5 = pred_species_only[, "Q2.5"],
+    Q97.5 = pred_species_only[, "Q97.5"]
+  ) %>%
+  arrange(desc(Averagemass_g_s))
+
+# Build phylogeny
+clean_species_name <- function(x) {
+  y <- as.character(x)
+  y <- trimws(y)
+  y <- gsub("_ott\\d+$", "", y)
+  y <- gsub("_", " ", y)
+  y <- iconv(y, from = "", to = "ASCII//TRANSLIT")
+  y <- gsub("\\b(sp|spp|cf)\\b\\.?","", y, ignore.case = TRUE)
+  y <- gsub("\\(.*?\\)", "", y)
+  y <- gsub("[\"'`]", "", y)
+  y <- gsub("[^A-Za-z0-9\\s-]", " ", y)
+  y <- gsub("\\s+", " ", y)
+  tolower(trimws(y))
+}
+
+species_for_tree <- unique(as.character(species_preds$Species))
+species_for_tree_clean <- unique(vapply(species_for_tree, clean_species_name, character(1)))
+
+tnrs_matches_fig <- tnrs_match_names(species_for_tree_clean)
+tnrs_df_fig <- as_tibble(tnrs_matches_fig) %>%
+  mutate(
+    search_string = as.character(search_string),
+    unique_name = as.character(unique_name),
+    ott_id = suppressWarnings(as.integer(ott_id))
+  )
+
+ott_lookup_fig <- tnrs_df_fig %>%
+  filter(!is.na(unique_name), unique_name != "", !is.na(ott_id)) %>%
+  mutate(
+    Species_phylo = paste0(gsub(" ", "_", unique_name), "_ott", ott_id)
+  ) %>%
+  select(search_string, Species_phylo, ott_id) %>%
+  distinct(search_string, .keep_all = TRUE)
+
+ott_ids_fig <- na.omit(unique(ott_lookup_fig$ott_id))
+tree_fig <- tol_induced_subtree(ott_ids = ott_ids_fig)
+tree_bl_fig <- ape::compute.brlen(tree_fig, method = "Grafen")
+phylo_cor_fig <- ape::vcv.phylo(tree_bl_fig, corr = TRUE)
+
+# Match predicted species to the tree built for this figure
+species_preds <- species_preds %>%
+  mutate(Species = as.character(Species))
+
+tips_to_keep <- intersect(tree_bl_fig$tip.label, species_preds$Species)
+tree_pruned <- ape::keep.tip(tree_bl_fig, tips_to_keep)
+
+spec_dat <- species_preds %>%
+  filter(Species %in% tips_to_keep) %>%
+  distinct(Species, .keep_all = TRUE) %>%
+  mutate(
+    Species_clean = gsub("_ott[0-9]+", "", Species),
+    Species_clean = gsub("_", " ", Species_clean)
+  ) %>%
+  mutate(Species_clean = case_when(
+    Species == "Pteronotus_parnellii_mesoamericanus_ott6146437" ~ "Pteronotus mesoamericanus",
+    Species == "Artibeus_glaucus_watsoni_ott805986" ~ "Dermanura watsoni",
+    Species == "Artibeus_phaeotis_ott513447" ~ "Dermanura phaotis",
+    Species == "Platyrrhinus_helleri_incarum_ott873032" ~ "Platyrrhinus incarum",
+    Species == "Artibeus_glaucus_gnomus_ott513423" ~ "Dermanura gnoma",
+    Species == "Micronycteris_nicefori_ott218136" ~ "Trinycteris nicefori",
+    Species == "Artibeus_aztecus_ott1039987" ~ "Dermanura azteca",
+    Species == "Artibeus_cinereus_ott513419" ~ "Dermanura cinereus",
+    TRUE ~ Species_clean
+  ))
+```
+### Creating plot: 
+
+```{r}
+#matching species to clades 
+p_tree_base <- ggtree(tree_pruned)
+tip_order_df <- p_tree_base$data %>%
+  filter(isTip) %>%
+  arrange(y) %>%
+  transmute(Species = label)
+
+tip_order_clean <- tip_order_df %>%
+  left_join(spec_dat %>% select(Species, Species_clean), by = "Species") %>%
+  mutate(Species_clean = make.unique(Species_clean)) %>%
+  pull(Species_clean)
+
+spec_dat <- spec_dat %>%
+  mutate(Species_clean = factor(Species_clean, levels = tip_order_clean))
+
+spec_dat <- spec_dat %>%
+  mutate(Species_label = paste0(Species_clean, " (", n_obs, ")"))
+
+tip_order_label <- tip_order_df %>%
+  left_join(spec_dat %>% select(Species, Species_label), by = "Species") %>%
+  mutate(
+    Species_label = ifelse(
+      is.na(Species_label),
+      paste0(gsub("_ott[0-9]+", "", Species) %>% gsub("_", " ", .), " (0)"),
+      Species_label
+    )
+  ) %>%
+  pull(Species_label)
+
+spec_dat <- spec_dat %>%
+  mutate(Species_label = factor(Species_label, levels = tip_order_label))
+
+n_species_plot <- nrow(spec_dat)
+n_effects_plot <- sum(spec_dat$n_obs)
+subtitle_txt <- paste0(
+  "Predicted species lnRR — ",
+  n_species_plot, " species, ",
+  n_effects_plot, " observations, 17 studies"
+)
+```
+# Adjusting clade labels: 
+```{r}
+clade_members_explicit <- list(
+  Stenodermatinae = c(
+    "Artibeus_jamaicensis_ott289157",
+    "Artibeus_lituratus_ott857633",
+    "Artibeus_cinereus_ott513419",
+    "Artibeus_concolor_ott513416",
+    "Artibeus_obscurus_ott513451",
+    "Artibeus_phaeotis_ott513447",
+    "Artibeus_glaucus_watsoni_ott805986",
+    "Artibeus_glaucus_gnomus_ott513423",
+    "Artibeus_toltecus_ott362821",
+    "Artibeus_anderseni_ott805983",
+    "Artibeus_aztecus_ott1039987",
+    "Artibeus_hartii_ott927292",
+    "Ametrida_centurio_ott895014",
+    "Centurio_senex_ott351782",
+    "Dermanura_phaeotis_ott513447",
+    "Dermanura_watsoni_ott805986",
+    "Dermanura_tolteca_ott362821",
+    "Platyrrhinus_dorsalis_ott981722",
+    "Platyrrhinus_brachycephalus_ott295643",
+    "Platyrrhinus_helleri_incarum_ott873032",
+    "Platyrrhinus_lineatus_ott780066",
+    "Platyrrhinus_recifinus_ott348438",
+    "Uroderma_bilobatum_ott401290",
+    "Uroderma_magnirostrum_ott605658",
+    "Vampyressa_pusilla_ott269233",
+    "Vampyressa_nymphaea_ott981726",
+    "Vampyressa_bidens_ott842098",
+    "Vampyressa_brocki_ott655347",
+    "Vampyrodes_caraccioli_ott269230",
+    "Vampyrodes_major_ott569768",
+    "Mesophylla_macconnelli_ott534178",
+    "Sturnira_lilium_ott401293",
+    "Sturnira_tildae_ott401295",
+    "Sturnira_ludovici_ott136687",
+    "Chiroderma_villosum_ott565586",
+    "Chiroderma_trinitatum_ott351787",
+    "Chiroderma_salvini_ott351785",
+    "Pygoderma_bilabiatum_ott894971",
+    "Plathyrrhinus_recifinus_ott348438",
+    "Vampyressa_thyone_ott393959"
+  ),
+  Natalidae = c("Natalus_stramineus_ott579474"),
+  Carolliinae_Rhinophyllinae = c(
+    "Carollia_brevicauda_ott758569",
+    "Carollia_perspicillata_ott1039980",
+    "Carollia_castanea_ott941606",
+    "Carollia_sowelli_ott958288",
+    "Carollia_subrufa_ott587100",
+    "Rhinophylla_pumilio_ott546394",
+    "Rhinophylla_fischerae_ott546395"
+  ),
+  Glossophaginae_Lonchophyllinae = c(
+    "Glossophaga_soricina_ott876514",
+    "Glossophaga_commissarisi_ott801225",
+    "Glossophaga_leachii_ott227303",
+    "Glossophaga_morenoi_ott227308",
+    "Choeroniscus_minor_ott596426",
+    "Choeroniscus_godmani_ott503371",
+    "Anoura_geoffroyi_ott688667",
+    "Anoura_caudifer_ott351792",
+    "Leptonycteris_nivalis_ott493740",
+    "Hylonycteris_underwoodi_ott658357",
+    "Hsunycteris_thomasi_ott546392",
+    "Lonchophylla_robusta_ott248894",
+    "Lonchophylla_mordax_ott248895",
+    "Lonchophylla_thomasi_ott546392",
+    "Lichonycteris_obscura_ott633519"
+  ),
+  Glyphonycterinae = c(
+    "Glyphonycteris_daviesi_ott201779",
+    "Glyphonycteris_sylvestris_ott599548",
+    "Micronycteris_nicefori_ott218136"
+  ),
+  Micronycterinae = c(
+    "Micronycteris_megalotis_ott218140",
+    "Micronycteris_brachyotis_ott201782",
+    "Micronycteris_microtis_ott596443",
+    "Micronycteris_hirsuta_ott218141",
+    "Micronycteris_schmidtorum_ott218135",
+    "Micronycteris_minuta_ott218139"
+  ),
+  Phyllostominae = c(
+    "Chrotopterus_auritus_ott1060474",
+    "Gardnerycteris_crenulatum_ott792611",
+    "Lophostoma_evotis_ott375137",
+    "Lophostoma_silvicolum_ott951266",
+    "Lophostoma_brasiliense_ott78017",
+    "Lophostoma_carrikeri_ott856239",
+    "Lophostoma_schulzi_ott78020",
+    "Phylloderma_stenops_ott792612",
+    "Phyllostomus_discolor_ott459982",
+    "Phyllostomus_hastatus_ott761775",
+    "Phyllostomus_elongatus_ott1011474",
+    "Tonatia_bidens_ott761780",
+    "Tonatia_saurophila_ott1074690",
+    "Trachops_cirrhosus_ott792613",
+    "Vampyrum_spectrum_ott353066",
+    "Mimon_cozumelae_ott860220",
+    "Chiroderma_doriae_ott565588",
+    "Lonchorhina_aurita_ott218142"
+  ),
+  Desmodontinae = c(
+    "Desmodus_rotundus_ott238431",
+    "Diaemus_youngi_ott1060472",
+    "Diphylla_ecaudata_ott1060475"
+  ),
+  Mormoopidae = c(
+    "Mormoops_megalophylla_ott342713",
+    "Pteronotus_parnellii_ott867405",
+    "Pteronotus_davyi_ott759858",
+    "Pteronotus_gymnonotus_ott554240",
+    "Pteronotus_personatus_ott554238",
+    "Pteronotus_alitonus_ott7067797",
+    "Pteronotus_rubiginosus_ott994100"
+  ),
+  Emballonuridae = c(
+    "Rhynchonycteris_naso_ott75166",
+    "Saccopteryx_bilineata_ott190912",
+    "Saccopteryx_leptura_ott75192",
+    "Saccopteryx_canescens_ott232381",
+    "Peropteryx_macrotis_ott75163",
+    "Peropteryx_kappleri_ott75160",
+    "Peropteryx_leucoptera_ott755426",
+    "Emballonura_atrata_ott156176",
+    "Diclidurus_albus_ott1060477",
+    "Centronycteris_maximiliani_ott846879",
+    "Centronycteris_centralis_ott432531",
+    "Cormura_brevirostris_ott75171",
+    "Cyttarops_alecto_ott599540"
+  ),
+  Noctilionidae = c(
+    "Noctilio_leporinus_ott604404",
+    "Noctilio_albiventris_ott604407"
+  ),
+  Vespertilionidae = c(
+    "Myotis_riparius_ott267991",
+    "Myotis_nigricans_ott307133",
+    "Myotis_albescens_ott353889",
+    "Myotis_brandtii_ott353460",
+    "Myotis_daubentonii_ott407052",
+    "Myotis_mystacinus_ott353458",
+    "Myotis_simus_ott1066079",
+    "Myotis_oxyotus_ott878679",
+    "Myotis_ruber_ott878678",
+    "Eptesicus_brasiliensis_ott176332",
+    "Eptesicus_furinalis_ott842474",
+    "Eptesicus_serotinus_ott15443",
+    "Lasionycteris_noctivagans_ott401283",
+    "Lasiurus_blossevillii_ott362948",
+    "Lasiurus_borealis_ott61860",
+    "Pipistrellus_nathusii_ott867399",
+    "Pipistrellus_ceylonicus_ott743848",
+    "Perimyotis_subflavus_ott977400",
+    "Eptesicus_fuscus_ott10737",
+    "Scotophilus_dinganii_ott759739",
+    "Scotophilus_nux_ott759736",
+    "Nyctalus_leisleri_ott342721",
+    "Nyctalus_noctula_ott261435",
+    "Plecotus_auritus_ott350140",
+    "Cynomops_abrasus_ott1014495",
+    "Cynomops_planirostris_ott130215",
+    "Dasypterus_ega_ott635119",
+    "Rhogeessa_tumida_ott76917"
+  ),
+  Molossidae = c(
+    "Molossus_molossus_ott301603",
+    "Molossus_rufus_ott267993",
+    "Molossops_temminckii_ott633522",
+    "Molossus_currentium_ott3614007"
+  )
+)
+
+spec_dat$clade_group <- NA_character_
+for (clade in names(clade_members_explicit)) {
+  members <- clade_members_explicit[[clade]]
+  spec_dat$clade_group[spec_dat$Species %in% members] <- clade
+}
+spec_dat$clade_group <- factor(spec_dat$clade_group, levels = names(clade_members_explicit))
+```
+# Adjusting colours
+```{r}
+clade_palette <- c(
+  Vespertilionidae = "#4477AA",
+  Stenodermatinae = "#228833",
+  Carolliinae_Rhinophyllinae = "#CCBB44",
+  Glyphonycterinae = "#66CCEE",
+  Micronycterinae = "#AA3377",
+  Phyllostominae = "#AA4499",
+  Glossophaginae_Lonchophyllinae = "#EE7733",
+  Natalidae = "#BB5566",
+  Desmodontinae = "#009988",
+  Emballonuridae = "#888888",
+  Noctilionidae = "#E69F00",
+  Mormoopidae = "#332288"
+)
+
+species_to_clade <- imap(clade_members_explicit, ~ setNames(rep(.y, length(.x)), .x)) %>%
+  flatten_chr()
+
+spec_dat <- spec_dat %>%
+  mutate(
+    Species = as.character(Species),
+    Species = stringr::str_squish(Species),
+    clade_group = species_to_clade[Species],
+    clade_group = ifelse(is.na(clade_group), "unknown", clade_group)
+  )
+
+clade_palette <- c(clade_palette, unknown = "#CFCFCF")
+spec_dat$FORCED_colour <- clade_palette[as.character(spec_dat$clade_group)]
+```
+#Plotting: 
+
+```{r}
+
+p_tree <- ggtree(tree_pruned) %<+% spec_dat +
+  geom_tippoint(aes(color = Estimate), size = 2) +
+  geom_tiplab(
+    aes(label = as.character(Species_label)),
+    align = TRUE, linetype = 0,
+    hjust = 0.05, offset = 0.035,
+    size = 2.6
+  ) +
+  xlim_tree(1) +
+  coord_cartesian(clip = "off") +
+  scale_color_gradient2(
+    low = "red",
+    mid = "grey80",
+    high = "lightblue",
+    midpoint = 0,
+    name = "Predicted lnRR",
+    guide = guide_colourbar(
+      barheight = unit(50, "mm"),
+      barwidth = unit(8, "mm")
+    )
+  ) +
+  theme_tree2() +
+  theme(
+    legend.position = c(0.15, 0.86),
+    plot.margin = margin(5, 80, 5, 5)
+  )
+
+# ---------------------------
+# 7) Forest plot
+# ---------------------------
+p_forest <- ggplot(spec_dat, aes(x = Estimate, y = Species_label)) +
+  geom_errorbarh(
+    aes(xmin = Q2.5, xmax = Q97.5, colour = FORCED_colour),
+    height = 0.2, alpha = 0.85, linewidth = 0.6
+  ) +
+  geom_point(aes(colour = FORCED_colour), size = 2.6) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50", linewidth = 0.4) +
+  scale_colour_identity() +
+  labs(
+    title = "Species-specific predicted lnRR (Fragment vs Continuous Forest)",
+    subtitle = subtitle_txt,
+    x = "Predicted lnRR (log response ratio of abundance)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0),
+    plot.subtitle = element_text(size = 11, hjust = 0),
+    panel.grid.major.y = element_line(color = "grey93"),
+    plot.margin = margin(20, 10, 5, 40)
+  )
+
+# ---------------------------
+# 8) Clade legend
+# ---------------------------
+clade_order_forced <- c(
+  "Stenodermatinae",
+  "Carolliinae_Rhinophyllinae",
+  "Glyphonycterinae",
+  "Phyllostominae",
+  "Glossophaginae_Lonchophyllinae",
+  "Micronycterinae",
+  "Mormoopidae",
+  "Desmodontinae",
+  "Noctilionidae",
+  "Emballonuridae",
+  "Vespertilionidae",
+  "Natalidae"
+)
+
+available_clades <- intersect(clade_order_forced, names(clade_palette))
+clade_palette <- clade_palette[available_clades]
+
+clade_labels <- c(
+  Vespertilionidae = "Vespertilionidae",
+  Stenodermatinae = "Stenodermatinae",
+  Carolliinae_Rhinophyllinae = "Carolliinae & Rhinophyllinae",
+  Glyphonycterinae = "Glyphonycterinae",
+  Micronycterinae = "Micronycterinae",
+  Phyllostominae = "Phyllostominae",
+  Glossophaginae_Lonchophyllinae = "Glossophaginae & Lonchophyllinae",
+  Desmodontinae = "Desmodontinae",
+  Noctilionidae = "Noctilionidae",
+  Emballonuridae = "Emballonuridae",
+  Mormoopidae = "Mormoopidae",
+  Natalidae = "Natalidae"
+)
+
+legend_df <- tibble(
+  clade = names(clade_palette),
+  label = unname(clade_labels[names(clade_palette)]),
+  y = seq_along(clade_palette),
+  hex = unname(clade_palette)
+)
+
+legend_plot <- ggplot(legend_df, aes(y = y)) +
+  geom_rect(
+    inherit.aes = FALSE,
+    xmin = 0, xmax = 1.25,
+    ymin = 0.15, ymax = nrow(legend_df) + 0.5,
+    fill = "white", colour = "grey80", linewidth = 0.25
+  ) +
+  geom_tile(
+    aes(x = 0.15, fill = clade),
+    width = 0.15,
+    height = 0.55,
+    colour = NA
+  ) +
+  geom_text(aes(x = 0.38, label = label), hjust = 0, size = 8, family = "sans") +
+  scale_fill_manual(values = clade_palette, guide = "none") +
+  scale_x_continuous(limits = c(0, 1.25), expand = c(0, 0)) +
+  scale_y_reverse(limits = c(nrow(legend_df) + 0.85, 0.15), expand = c(0, 0)) +
+  theme_void() +
+  theme(
+    plot.background = element_rect(fill = "white", colour = NA),
+    panel.background = element_rect(fill = "white", colour = NA)
+  )
+
+ggsave(
+  filename = "legend_plot_phyloFig.tiff",
+  plot = legend_plot,
+  device = ragg::agg_tiff,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 600,
+  limitsize = FALSE
+)
+
+# ---------------------------
+# 9) Combine and save
+# ---------------------------
+p_combined <- plot_grid(
+  p_tree,
+  p_forest,
+  ncol = 2,
+  rel_widths = c(0.35, 0.65),
+  align = "h"
+)
+
+p_final <- p_combined +
+  coord_cartesian(clip = "off") +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.margin = margin(t = 30, r = 30, b = 30, l = 30),
+    strip.placement = "outside",
+    strip.background = element_rect(fill = "white", colour = NA),
+    strip.text = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    legend.position = "bottom"
+  )
+
+print(p_final)
+
+ggsave(
+  filename = "Fig_4_phylogeny.tiff",
+  plot = p_final,
+  device = ragg::agg_tiff,
+  width = 16,
+  height = 10,
+  units = "in",
+  dpi = 600,
+  limitsize = FALSE
+)
+```
